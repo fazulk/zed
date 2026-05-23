@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+unset ZED_STATELESS
+
+export CARGO_TARGET_DIR="${ZED_CARGO_TARGET_DIR:-$HOME/.cache/zed-cargo-target}"
+mkdir -p "$CARGO_TARGET_DIR"
+if [ ! -e target ]; then
+    ln -s "$CARGO_TARGET_DIR" target
+fi
+
+exec cargo run --profile release-fast --package zed -- "$@"

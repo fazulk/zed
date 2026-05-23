@@ -13,4 +13,18 @@
     "allow_concurrent_runs": true,
     "use_new_terminal": false,
   },
+  {
+    "label": "Zed Dev Main Profile",
+    "command": "./script/zed-dev-main-profile",
+    "args": [],
+    "allow_concurrent_runs": true,
+    "use_new_terminal": false,
+  },
+  {
+    "label": "Zed DMG Main Profile",
+    "command": "./script/zed-dmg-main-profile",
+    "args": [],
+    "allow_concurrent_runs": true,
+    "use_new_terminal": true,
+  },
 ]

@@ -305,7 +305,7 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         telemetry::event!("Git Diff Opened", source = "Git Panel Staging");
-        let intended_repo = resolve_active_repository(workspace, cx);
+        let intended_repo = workspace.project().read(cx).active_repository(cx);
 
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             std::mem::discriminant(item.read(cx).diff_base(cx))
@@ -1069,6 +1069,8 @@ impl Item for ProjectDiff {
         match self.diff_base(cx) {
             DiffBase::Head => Some("Project Diff".into()),
             DiffBase::Merge { .. } => Some("Branch Diff".into()),
+            DiffBase::Staged => Some("Staged Changes".into()),
+            DiffBase::Unstaged => Some("Unstaged Changes".into()),
         }
     }
 
