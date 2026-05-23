@@ -1408,6 +1408,15 @@ impl GitPanel {
             self.toggle_directory(&dir_entry.key, window, cx);
             return;
         }
+        self.open_solo_diff(window, cx);
+    }
+
+    fn open_project_diff(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         maybe!({
             let selected_ix = self.selected_entry?;
             let entry = self.entries.get(selected_ix)?.status_entry()?;
@@ -1456,12 +1465,7 @@ impl GitPanel {
         });
     }
 
-    fn open_solo_diff(
-        &mut self,
-        _: &menu::SecondaryConfirm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_solo_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         maybe!({
             let entry = self
                 .entries
@@ -6038,8 +6042,8 @@ impl GitPanel {
                     git::AddToGitignore.boxed_clone(),
                 )
                 .separator()
-                .action("Open Diff", menu::Confirm.boxed_clone())
-                .action("Open Solo Diff", menu::SecondaryConfirm.boxed_clone())
+                .action("Open Solo Diff", menu::Confirm.boxed_clone())
+                .action("Open Project Diff", menu::SecondaryConfirm.boxed_clone())
                 .when(!is_created, |context_menu| {
                     context_menu
                         .separator()
@@ -6319,7 +6323,7 @@ impl GitPanel {
                     this.selected_entry = Some(ix);
                     cx.notify();
                     if event.click_count() > 1 || event.modifiers().secondary() {
-                        this.open_solo_diff(&Default::default(), window, cx)
+                        this.open_project_diff(&Default::default(), window, cx)
                     } else {
                         this.open_diff(&Default::default(), window, cx);
                         this.focus_handle.focus(window, cx);
@@ -6769,7 +6773,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
-            .on_action(cx.listener(Self::open_solo_diff))
+            .on_action(cx.listener(Self::open_project_diff))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
@@ -8469,11 +8473,24 @@ mod tests {
         })
         .await;
 
-        // Confirm that `Open Diff` still works for the untracked file, updating
-        // the Project Diff's active path.
+        // Confirm that `Open Diff` opens the untracked file in a solo diff.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(1);
             panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .item_of_type::<SoloDiffView>(cx)
+                .expect("SoloDiffView should exist");
+        });
+
+        // Confirm that the alternate project diff action still works for the
+        // untracked file, updating the Project Diff's active path.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(1);
+            panel.open_project_diff(&menu::SecondaryConfirm, window, cx);
         });
         cx.run_until_parked();
 
