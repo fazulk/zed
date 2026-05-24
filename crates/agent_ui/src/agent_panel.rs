@@ -71,7 +71,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
-use project::{Project, ProjectPath, Worktree};
+use project::{ExternalAgentSource, Project, ProjectPath, Worktree};
 use prompt_store::PromptStore;
 use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
@@ -306,7 +306,7 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
-                            panel.new_external_agent_thread(action, window, cx);
+                            panel.new_external_agent_thread(action, Some(workspace), window, cx);
                         });
                     }
                 })
@@ -1672,6 +1672,7 @@ impl AgentPanel {
     pub fn new_external_agent_thread(
         &mut self,
         action: &NewExternalAgentThread,
+        workspace: Option<&Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1680,7 +1681,89 @@ impl AgentPanel {
         }
 
         self.selected_agent = action.agent.clone().into();
+        if self
+            .project
+            .read(cx)
+            .agent_server_store()
+            .read(cx)
+            .agent_source(&action.agent)
+            == Some(ExternalAgentSource::Terminal)
+        {
+            self.new_terminal_agent_thread(
+                action.agent.clone(),
+                workspace,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            return;
+        }
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+    }
+
+    fn new_terminal_agent_thread(
+        &mut self,
+        agent_id: AgentId,
+        workspace: Option<&Workspace>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+
+        let agent_server_store = self.project.read(cx).agent_server_store().clone();
+        let Some(command_task) = agent_server_store.update(cx, |store, cx| {
+            store.external_agent_command(&agent_id, vec![], HashMap::default(), &mut cx.to_async())
+        }) else {
+            return;
+        };
+
+        let display_name = agent_server_store
+            .read(cx)
+            .agent_display_name(&agent_id)
+            .unwrap_or_else(|| agent_id.0.clone());
+        let task_id = task::TaskId(format!("terminal-agent-{}", agent_id.0));
+        let workspace_handle = self.workspace.clone();
+        let working_directory = self.terminal_working_directory(workspace, cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let command = command_task.await?;
+            let task = SpawnInTerminal {
+                id: task_id,
+                full_label: display_name.to_string(),
+                label: display_name.to_string(),
+                command: Some(command.path.to_string_lossy().into_owned()),
+                args: command.args,
+                command_label: display_name.to_string(),
+                cwd: working_directory,
+                env: command.env.unwrap_or_default(),
+                use_new_terminal: true,
+                allow_concurrent_runs: true,
+                reveal: RevealStrategy::Always,
+                reveal_target: task::RevealTarget::Sidebar,
+                shell: Shell::System,
+                show_summary: false,
+                show_command: false,
+                show_rerun: false,
+                save: Default::default(),
+                hide: Default::default(),
+            };
+
+            let spawn_task = this.update_in(cx, |this, window, cx| {
+                this.spawn_task(task, source, window, cx)
+            })?;
+            spawn_task.await;
+
+            workspace_handle
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                })
+                .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn new_terminal(
@@ -5164,7 +5247,13 @@ impl AgentPanel {
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
 
         let (selected_agent_custom_icon, selected_agent_label) = if showing_terminal {
-            (None, SharedString::from("Terminal"))
+            let terminal_title = self
+                .active_terminal_id()
+                .and_then(|terminal_id| self.terminals.get(&terminal_id))
+                .map(|terminal| terminal.title(cx))
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| SharedString::from("Terminal"));
+            (None, terminal_title)
         } else if let Agent::Custom { id, .. } = &self.selected_agent {
             let store = agent_server_store.read(cx);
             let icon = store.agent_icon(&id);
@@ -5297,6 +5386,7 @@ impl AgentPanel {
                             struct AgentMenuItem {
                                 id: AgentId,
                                 display_name: SharedString,
+                                source: ExternalAgentSource,
                             }
 
                             let agent_items = agent_server_store
@@ -5314,6 +5404,9 @@ impl AgentPanel {
                                     AgentMenuItem {
                                         id: agent_id.clone(),
                                         display_name,
+                                        source: agent_server_store
+                                            .agent_source(agent_id)
+                                            .unwrap_or_default(),
                                     }
                                 })
                                 .sorted_unstable_by_key(|e| e.display_name.to_lowercase())
@@ -5335,6 +5428,8 @@ impl AgentPanel {
 
                                 if let Some(icon_path) = icon_path {
                                     entry = entry.custom_icon_svg(icon_path);
+                                } else if item.source == ExternalAgentSource::Terminal {
+                                    entry = entry.icon(IconName::Terminal);
                                 } else {
                                     entry = entry.icon(IconName::Sparkle);
                                 }
@@ -5342,6 +5437,7 @@ impl AgentPanel {
                                 entry = entry
                                     .when(
                                         !showing_terminal
+                                            && item.source != ExternalAgentSource::Terminal
                                             && is_agent_selected(Agent::Custom {
                                                 id: item.id.clone(),
                                             }),
@@ -5363,6 +5459,7 @@ impl AgentPanel {
                                                                 &NewExternalAgentThread {
                                                                     agent: agent_id.clone(),
                                                                 },
+                                                                Some(workspace),
                                                                 window,
                                                                 cx,
                                                             );
@@ -6311,7 +6408,7 @@ mod tests {
     use fs::FakeFs;
     use gpui::{App, TestAppContext, UpdateGlobal, VisualTestContext};
     use parking_lot::Mutex;
-    use project::{Project, WorktreePaths};
+    use project::{Project, WorktreePaths, agent_server_store::AllAgentServersSettings};
     use std::any::Any;
 
     use serde_json::json;
@@ -8095,6 +8192,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_terminal_external_agent_from_workspace_update(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(
+                    [(
+                        "terminal-agent".to_string(),
+                        settings::CustomAgentServerSettings::Terminal {
+                            path: "echo".into(),
+                            args: vec!["hello".into()],
+                            env: HashMap::default(),
+                        }
+                        .into(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                cx,
+            );
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, None, window, cx));
+            workspace.add_panel(panel, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                panic!("agent panel should be installed");
+            };
+            panel.update(cx, |panel, cx| {
+                panel.new_external_agent_thread(
+                    &NewExternalAgentThread {
+                        agent: AgentId::new("terminal-agent"),
+                    },
+                    Some(workspace),
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn test_empty_workspace_does_not_create_agent_entries(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
@@ -8137,6 +8292,7 @@ mod tests {
                 &NewExternalAgentThread {
                     agent: AgentId::new("external-agent"),
                 },
+                None,
                 window,
                 cx,
             );

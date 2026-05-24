@@ -153,7 +153,10 @@ impl AgentRegistryPage {
                 CustomAgentServerSettings::Registry { .. } => {
                     RegistryInstallStatus::InstalledRegistry
                 }
-                CustomAgentServerSettings::Custom { .. } => RegistryInstallStatus::InstalledCustom,
+                CustomAgentServerSettings::Custom { .. }
+                | CustomAgentServerSettings::Terminal { .. } => {
+                    RegistryInstallStatus::InstalledCustom
+                }
             };
             self.installed_statuses.insert(id.clone(), status);
         }

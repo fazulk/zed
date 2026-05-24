@@ -111,6 +111,7 @@ impl std::borrow::Borrow<str> for AgentId {
 pub enum ExternalAgentSource {
     #[default]
     Custom,
+    Terminal,
     Registry,
 }
 
@@ -346,7 +347,8 @@ impl AgentServerStore {
 
         for (name, settings) in new_settings.iter() {
             match settings {
-                CustomAgentServerSettings::Custom { command, .. } => {
+                CustomAgentServerSettings::Custom { command, .. }
+                | CustomAgentServerSettings::Terminal { command } => {
                     let agent_name = AgentId(name.clone().into());
                     self.external_agents.insert(
                         agent_name.clone(),
@@ -355,7 +357,17 @@ impl AgentServerStore {
                                 command: command.clone(),
                                 project_environment: project_environment.clone(),
                             }) as Box<dyn ExternalAgentServer>,
-                            ExternalAgentSource::Custom,
+                            match settings {
+                                CustomAgentServerSettings::Custom { .. } => {
+                                    ExternalAgentSource::Custom
+                                }
+                                CustomAgentServerSettings::Terminal { .. } => {
+                                    ExternalAgentSource::Terminal
+                                }
+                                CustomAgentServerSettings::Registry { .. } => {
+                                    unreachable!("registry settings handled separately")
+                                }
+                            },
                             None,
                             None,
                         ),
@@ -565,6 +577,17 @@ impl AgentServerStore {
         self.external_agents
             .get_mut(name)
             .map(|entry| entry.server.as_mut())
+    }
+
+    pub fn external_agent_command(
+        &mut self,
+        name: &AgentId,
+        extra_args: Vec<String>,
+        extra_env: HashMap<String, String>,
+        cx: &mut AsyncApp,
+    ) -> Option<Task<Result<AgentServerCommand>>> {
+        self.get_external_agent(name)
+            .map(|agent| agent.get_command(extra_args, extra_env, cx))
     }
 
     pub fn no_browser(&self) -> bool {
@@ -1380,6 +1403,9 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         favorite_config_option_values: HashMap<String, Vec<String>>,
     },
+    Terminal {
+        command: AgentServerCommand,
+    },
     Registry {
         /// Additional environment variables to pass to the agent.
         ///
@@ -1419,7 +1445,8 @@ pub enum CustomAgentServerSettings {
 impl CustomAgentServerSettings {
     pub fn command(&self) -> Option<&AgentServerCommand> {
         match self {
-            CustomAgentServerSettings::Custom { command, .. } => Some(command),
+            CustomAgentServerSettings::Custom { command, .. }
+            | CustomAgentServerSettings::Terminal { command } => Some(command),
             CustomAgentServerSettings::Registry { .. } => None,
         }
     }
@@ -1428,6 +1455,7 @@ impl CustomAgentServerSettings {
         match self {
             CustomAgentServerSettings::Custom { default_mode, .. }
             | CustomAgentServerSettings::Registry { default_mode, .. } => default_mode.as_deref(),
+            CustomAgentServerSettings::Terminal { .. } => None,
         }
     }
 
@@ -1435,6 +1463,7 @@ impl CustomAgentServerSettings {
         match self {
             CustomAgentServerSettings::Custom { default_model, .. }
             | CustomAgentServerSettings::Registry { default_model, .. } => default_model.as_deref(),
+            CustomAgentServerSettings::Terminal { .. } => None,
         }
     }
 
@@ -1446,6 +1475,7 @@ impl CustomAgentServerSettings {
             | CustomAgentServerSettings::Registry {
                 favorite_models, ..
             } => favorite_models,
+            CustomAgentServerSettings::Terminal { .. } => &[],
         }
     }
 
@@ -1459,6 +1489,7 @@ impl CustomAgentServerSettings {
                 default_config_options,
                 ..
             } => default_config_options.get(config_id).map(|s| s.as_str()),
+            CustomAgentServerSettings::Terminal { .. } => None,
         }
     }
 
@@ -1474,6 +1505,7 @@ impl CustomAgentServerSettings {
             } => favorite_config_option_values
                 .get(config_id)
                 .map(|v| v.as_slice()),
+            CustomAgentServerSettings::Terminal { .. } => None,
         }
     }
 }
@@ -1502,6 +1534,15 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_config_options,
                 favorite_config_option_values,
             },
+            settings::CustomAgentServerSettings::Terminal { path, args, env } => {
+                CustomAgentServerSettings::Terminal {
+                    command: AgentServerCommand {
+                        path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref()),
+                        args,
+                        env: Some(env),
+                    },
+                }
+            }
             settings::CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
@@ -1612,6 +1653,29 @@ mod tests {
         });
     }
 
+    fn set_terminal_agent_settings(cx: &mut TestAppContext, agent_name: &str) {
+        cx.update(|cx| {
+            let mut env = HashMap::default();
+            env.insert("PI_ENV".into(), "1".into());
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(
+                    [(
+                        agent_name.to_string(),
+                        settings::CustomAgentServerSettings::Terminal {
+                            path: "pi".into(),
+                            args: vec!["--model".into(), "best".into()],
+                            env,
+                        }
+                        .into(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                cx,
+            );
+        });
+    }
+
     fn create_agent_server_store(cx: &mut TestAppContext) -> gpui::Entity<AgentServerStore> {
         cx.update(|cx| {
             let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor().clone());
@@ -1632,6 +1696,41 @@ mod tests {
                 )
             })
         })
+    }
+
+    #[gpui::test]
+    async fn test_terminal_agent_settings_register_terminal_source(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        set_terminal_agent_settings(cx, "pi");
+        let store = create_agent_server_store(cx);
+
+        let command = store
+            .update(cx, |store, cx| {
+                assert_eq!(
+                    store.agent_source(&AgentId::from("pi")),
+                    Some(ExternalAgentSource::Terminal)
+                );
+                store.external_agent_command(
+                    &AgentId::from("pi"),
+                    Vec::new(),
+                    HashMap::default(),
+                    &mut cx.to_async(),
+                )
+            })
+            .expect("terminal agent should be registered")
+            .await
+            .expect("terminal command should resolve");
+
+        assert_eq!(command.path, PathBuf::from("pi"));
+        assert_eq!(command.args, vec!["--model", "best"]);
+        assert_eq!(
+            command
+                .env
+                .unwrap_or_default()
+                .get("PI_ENV")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]

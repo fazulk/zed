@@ -1175,7 +1175,9 @@ impl AgentConfiguration {
 
         let source_kind = match source {
             ExternalAgentSource::Registry => AiSettingItemSource::Registry,
-            ExternalAgentSource::Custom => AiSettingItemSource::Custom,
+            ExternalAgentSource::Custom | ExternalAgentSource::Terminal => {
+                AiSettingItemSource::Custom
+            }
         };
 
         let agent_server_name = AgentId(id.clone());
@@ -1183,7 +1185,9 @@ impl AgentConfiguration {
             id: agent_server_name.clone(),
         };
 
-        let (connection_status, running_version) = {
+        let (connection_status, running_version) = if source == ExternalAgentSource::Terminal {
+            (AgentConnectionStatus::Disconnected, None)
+        } else {
             let connection_store = self.agent_connection_store.read(cx);
             (
                 connection_store.connection_status(&agent, cx),
@@ -1191,10 +1195,11 @@ impl AgentConfiguration {
             )
         };
 
-        let restart_button = matches!(
-            connection_status,
-            AgentConnectionStatus::Connected | AgentConnectionStatus::Connecting
-        )
+        let restart_button = (source != ExternalAgentSource::Terminal
+            && matches!(
+                connection_status,
+                AgentConnectionStatus::Connected | AgentConnectionStatus::Connecting
+            ))
         .then(|| {
             IconButton::new(
                 SharedString::from(format!("restart-{}", id)),
@@ -1245,8 +1250,14 @@ impl AgentConfiguration {
                     })),
                 )
             }
-            ExternalAgentSource::Custom => {
+            ExternalAgentSource::Custom | ExternalAgentSource::Terminal => {
                 let fs = self.fs.clone();
+                let is_terminal = source == ExternalAgentSource::Terminal;
+                let tooltip = if is_terminal {
+                    "Remove Terminal Agent"
+                } else {
+                    "Remove Custom Agent"
+                };
                 Some(
                     IconButton::new(
                         SharedString::from(format!("uninstall-{}", id)),
@@ -1254,7 +1265,7 @@ impl AgentConfiguration {
                     )
                     .icon_color(Color::Muted)
                     .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Remove Custom Agent"))
+                    .tooltip(Tooltip::text(tooltip))
                     .on_click(cx.listener(move |_, _, _window, cx| {
                         let agent_name = agent_server_name.clone();
                         update_settings_file(fs.clone(), cx, move |settings, _| {
@@ -1263,8 +1274,12 @@ impl AgentConfiguration {
                             };
                             if let Some(entry) = agent_servers.get(agent_name.0.as_ref())
                                 && matches!(
-                                    entry,
-                                    settings::CustomAgentServerSettings::Custom { .. }
+                                    (entry, is_terminal),
+                                    (settings::CustomAgentServerSettings::Custom { .. }, false)
+                                        | (
+                                            settings::CustomAgentServerSettings::Terminal { .. },
+                                            true
+                                        )
                                 )
                             {
                                 agent_servers.remove(agent_name.0.as_ref());

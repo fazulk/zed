@@ -523,6 +523,15 @@ pub enum CustomAgentServerSettings {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
     },
+    Terminal {
+        #[serde(rename = "command")]
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        /// Default: {}
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        env: HashMap<String, String>,
+    },
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
     Registry {

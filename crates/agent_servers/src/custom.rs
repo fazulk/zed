@@ -119,6 +119,7 @@ impl AgentServer for CustomAgentServer {
                         }
                     }
                 }
+                settings::CustomAgentServerSettings::Terminal { .. } => {}
             }
         });
     }
@@ -137,6 +138,7 @@ impl AgentServer for CustomAgentServer {
                 | settings::CustomAgentServerSettings::Registry { default_mode, .. } => {
                     *default_mode = mode_id.map(|m| m.to_string());
                 }
+                settings::CustomAgentServerSettings::Terminal { .. } => {}
             }
         });
     }
@@ -168,6 +170,7 @@ impl AgentServer for CustomAgentServer {
                 | settings::CustomAgentServerSettings::Registry { default_model, .. } => {
                     *default_model = model_id.map(|m| m.to_string());
                 }
+                settings::CustomAgentServerSettings::Terminal { .. } => {}
             }
         });
     }
@@ -213,6 +216,7 @@ impl AgentServer for CustomAgentServer {
                 | settings::CustomAgentServerSettings::Registry {
                     favorite_models, ..
                 } => favorite_models,
+                settings::CustomAgentServerSettings::Terminal { .. } => return,
             };
 
             let model_id_str = model_id.to_string();
@@ -271,6 +275,7 @@ impl AgentServer for CustomAgentServer {
                         default_config_options.remove(&config_id);
                     }
                 }
+                settings::CustomAgentServerSettings::Terminal { .. } => {}
             }
         });
     }
@@ -298,6 +303,9 @@ impl AgentServer for CustomAgentServer {
                         default_config_options,
                         ..
                     } => default_config_options.clone(),
+                    project::agent_server_store::CustomAgentServerSettings::Terminal { .. } => {
+                        Default::default()
+                    }
                 })
                 .unwrap_or_default()
         });
