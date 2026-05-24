@@ -6,7 +6,7 @@ use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
-use crate::{branch_picker, picker_prompt, render_remote_button};
+use crate::{PullRequestMenuState, branch_picker, picker_prompt, render_remote_button};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
@@ -689,6 +689,34 @@ impl TruncatedPatch {
     }
 }
 
+#[derive(Clone, Debug)]
+enum PullRequestStatus {
+    Unknown,
+    Loading,
+    NotFound,
+    Found(GhPullRequest),
+    Unsupported,
+}
+
+struct GhPullRequestContext {
+    work_directory_abs_path: Arc<Path>,
+    source_branch: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GhPullRequest {
+    number: u32,
+    title: String,
+    body: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GeneratedPullRequestText {
+    title: String,
+    body: String,
+}
+
 pub struct GitPanel {
     pub(crate) active_repository: Option<Entity<Repository>>,
     pub(crate) commit_editor: Entity<Editor>,
@@ -698,6 +726,10 @@ pub struct GitPanel {
     conflicted_staged_count: usize,
     add_coauthors: bool,
     generate_commit_message_task: Option<Task<Option<()>>>,
+    pull_request_status: PullRequestStatus,
+    pull_request_status_key: Option<String>,
+    pull_request_status_task: Option<Task<()>>,
+    update_pull_request_task: Option<Task<()>>,
     entries: Vec<GitListEntry>,
     view_mode: GitPanelViewMode,
     entries_indices: HashMap<RepoPath, usize>,
@@ -901,6 +933,10 @@ impl GitPanel {
                 conflicted_staged_count: 0,
                 add_coauthors: true,
                 generate_commit_message_task: None,
+                pull_request_status: PullRequestStatus::Unknown,
+                pull_request_status_key: None,
+                pull_request_status_task: None,
+                update_pull_request_task: None,
                 entries: Vec::new(),
                 view_mode: GitPanelViewMode::from_settings(cx),
                 entries_indices: HashMap::default(),
@@ -3353,65 +3389,531 @@ impl GitPanel {
         }
     }
 
-    pub fn create_pull_request(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let result = (|| -> anyhow::Result<()> {
-            let repo = self
-                .active_repository
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("No active repository"))?;
+    fn gh_pull_request_context(&self, cx: &App) -> anyhow::Result<GhPullRequestContext> {
+        let repo = self
+            .active_repository
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No active repository"))?;
+        let repository = repo.read(cx);
+        let branch = repository
+            .branch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No active branch"))?;
 
-            let (branch, remote_origin, remote_upstream) = {
-                let repository = repo.read(cx);
-                (
-                    repository.branch.clone(),
-                    repository.remote_origin_url.clone(),
-                    repository.remote_upstream_url.clone(),
+        Ok(GhPullRequestContext {
+            work_directory_abs_path: repository.work_directory_abs_path.clone(),
+            source_branch: branch.name().to_string(),
+        })
+    }
+
+    pub fn create_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let context = match self.gh_pull_request_context(cx) {
+            Ok(context) => context,
+            Err(err) => {
+                cx.defer_in(window, |panel, _window, cx| {
+                    panel.show_error_toast("create pull request", err, cx);
+                });
+                return;
+            }
+        };
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let model = LanguageModelRegistry::read_global(cx).commit_message_model(cx);
+        let temperature = model.as_ref().and_then(|ConfiguredModel { model, .. }| {
+            AgentSettings::temperature_for_model(model, cx)
+        });
+
+        self.pull_request_status = PullRequestStatus::Loading;
+        self.show_pull_request_creating_toast(cx);
+        self.pull_request_status_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let generated = Self::generate_created_pull_request_text(
+                    repo,
+                    &context,
+                    model,
+                    temperature,
+                    cx,
                 )
+                .await?;
+
+                let output = Self::run_gh_command(
+                    context.work_directory_abs_path.clone(),
+                    vec![
+                        "pr".into(),
+                        "create".into(),
+                        "--title".into(),
+                        generated.title.clone(),
+                        "--body".into(),
+                        generated.body.clone(),
+                        "--head".into(),
+                        context.source_branch.clone(),
+                    ],
+                )
+                .await?;
+                let created_url = Self::extract_url_from_output(&output);
+
+                match Self::load_pull_request_with_gh(context).await? {
+                    Some(mut pull_request) => {
+                        if pull_request.url.is_none() {
+                            pull_request.url = created_url;
+                        }
+                        Ok(pull_request)
+                    }
+                    None => {
+                        let url = created_url.ok_or_else(|| {
+                            anyhow::anyhow!("created pull request but could not load it")
+                        })?;
+                        let number = Self::pull_request_number_from_url(&url).ok_or_else(|| {
+                            anyhow::anyhow!("created pull request but could not parse its URL")
+                        })?;
+                        Ok(GhPullRequest {
+                            number,
+                            title: generated.title,
+                            body: Some(generated.body),
+                            url: Some(url),
+                        })
+                    }
+                }
+            }
+            .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(pull_request) => {
+                        this.show_pull_request_created_toast(&pull_request, cx);
+                        this.pull_request_status = PullRequestStatus::Found(pull_request);
+                    }
+                    Err(err) => {
+                        this.pull_request_status = PullRequestStatus::NotFound;
+                        this.show_error_toast("create pull request", err, cx);
+                    }
+                }
+                this.pull_request_status_task = None;
+                cx.notify();
+                window.refresh();
+            })
+            .ok();
+        }));
+    }
+
+    fn update_pull_request_status(&mut self, cx: &mut Context<Self>) {
+        let context = match self.gh_pull_request_context(cx) {
+            Ok(context) => context,
+            Err(_) => {
+                self.pull_request_status = PullRequestStatus::Unsupported;
+                self.pull_request_status_key = None;
+                self.pull_request_status_task = None;
+                return;
+            }
+        };
+
+        let status_key = format!(
+            "{}:{}",
+            context.work_directory_abs_path.display(),
+            context.source_branch
+        );
+        if self.pull_request_status_key.as_deref() == Some(status_key.as_str())
+            && !matches!(self.pull_request_status, PullRequestStatus::Unknown)
+        {
+            return;
+        }
+
+        self.pull_request_status = PullRequestStatus::Loading;
+        self.pull_request_status_key = Some(status_key);
+        self.pull_request_status_task = Some(cx.spawn(async move |this, cx| {
+            let result = Self::load_pull_request_with_gh(context).await;
+
+            this.update(cx, |this, cx| {
+                this.pull_request_status = match result {
+                    Ok(Some(pull_request)) => PullRequestStatus::Found(pull_request),
+                    Ok(None) => PullRequestStatus::NotFound,
+                    Err(error) => {
+                        log::warn!("failed to load pull request status with gh: {error:?}");
+                        PullRequestStatus::Unsupported
+                    }
+                };
+                this.pull_request_status_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    async fn load_pull_request_with_gh(
+        context: GhPullRequestContext,
+    ) -> anyhow::Result<Option<GhPullRequest>> {
+        let output = Self::run_gh_command(
+            context.work_directory_abs_path,
+            vec![
+                "pr".into(),
+                "list".into(),
+                "--head".into(),
+                context.source_branch,
+                "--state".into(),
+                "open".into(),
+                "--json".into(),
+                "number,title,body,url".into(),
+                "--limit".into(),
+                "1".into(),
+            ],
+        )
+        .await?;
+        let mut pull_requests = serde_json::from_str::<Vec<GhPullRequest>>(&output)
+            .context("failed to parse gh pull request output")?;
+        Ok(pull_requests.pop())
+    }
+
+    async fn run_gh_command(
+        work_directory_abs_path: Arc<Path>,
+        args: Vec<String>,
+    ) -> anyhow::Result<String> {
+        let mut command = util::command::new_command("gh");
+        command
+            .current_dir(&work_directory_abs_path)
+            .env("GH_PROMPT_DISABLED", "1")
+            .args(args);
+        let output = command.output().await.context("failed to run gh")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let message = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
             };
+            anyhow::bail!("gh failed: {message}");
+        }
 
-            let branch = branch.ok_or_else(|| anyhow::anyhow!("No active branch"))?;
-            let source_branch = branch
-                .upstream
-                .as_ref()
-                .filter(|upstream| matches!(upstream.tracking, UpstreamTracking::Tracked(_)))
-                .and_then(|upstream| upstream.branch_name())
-                .ok_or_else(|| anyhow::anyhow!("No remote configured for repository"))?;
-            let source_branch = source_branch.to_string();
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
 
-            let remote_url = branch
-                .upstream
-                .as_ref()
-                .and_then(|upstream| match upstream.remote_name() {
-                    Some("upstream") => remote_upstream.as_deref(),
-                    Some(_) => remote_origin.as_deref(),
-                    None => None,
-                })
-                .or(remote_origin.as_deref())
-                .or(remote_upstream.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("No remote configured for repository"))?;
-            let remote_url = remote_url.to_string();
+    fn extract_url_from_output(output: &str) -> Option<String> {
+        output
+            .split_whitespace()
+            .find(|part| part.starts_with("https://") || part.starts_with("http://"))
+            .map(|part| {
+                part.trim_matches(|c: char| c == ',' || c == '.')
+                    .to_string()
+            })
+    }
 
-            let provider_registry = GitHostingProviderRegistry::global(cx);
-            let Some((provider, parsed_remote)) =
-                git::parse_git_remote_url(provider_registry, &remote_url)
-            else {
-                return Err(anyhow::anyhow!("Unsupported remote URL: {}", remote_url));
-            };
+    fn pull_request_number_from_url(url: &str) -> Option<u32> {
+        url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+    }
 
-            let Some(url) = provider.build_create_pull_request_url(&parsed_remote, &source_branch)
-            else {
-                return Err(anyhow::anyhow!("Unable to construct pull request URL"));
-            };
-
-            cx.open_url(url.as_str());
-            Ok(())
-        })();
-
-        if let Err(err) = result {
-            log::error!("Error while creating pull request {:?}", err);
-            cx.defer_in(window, |panel, _window, cx| {
-                panel.show_error_toast("create pull request", err, cx);
+    fn show_pull_request_creating_toast(&self, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new("Creating pull request", cx, |this, _cx| {
+                    this.icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .dismiss_button(true)
+                });
+                workspace.toggle_status_toast(toast, cx)
             });
+        });
+    }
+
+    fn show_pull_request_created_toast(&self, pull_request: &GhPullRequest, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let pull_request_url = pull_request.url.clone();
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new("Pull request created", cx, move |this, _cx| {
+                    let this = this
+                        .icon(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .dismiss_button(true);
+
+                    if let Some(url) = pull_request_url.clone() {
+                        this.action("Open PR", move |_, cx| cx.open_url(&url))
+                    } else {
+                        this
+                    }
+                });
+                workspace.toggle_status_toast(toast, cx)
+            });
+        });
+    }
+
+    pub fn update_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pull_request) = self.current_pull_request().cloned() else {
+            return;
+        };
+        let context = match self.gh_pull_request_context(cx) {
+            Ok(context) => context,
+            Err(err) => {
+                cx.defer_in(window, |panel, _window, cx| {
+                    panel.show_error_toast("update pull request", err, cx);
+                });
+                return;
+            }
+        };
+        let model = LanguageModelRegistry::read_global(cx).commit_message_model(cx);
+        let temperature = model.as_ref().and_then(|ConfiguredModel { model, .. }| {
+            AgentSettings::temperature_for_model(model, cx)
+        });
+
+        self.update_pull_request_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let Some(ConfiguredModel {
+                    provider: model_provider,
+                    model,
+                }) = model
+                else {
+                    anyhow::bail!("No commit message model configured");
+                };
+
+                if let Some(task) = cx.update(|_, cx| {
+                    if !model_provider.is_authenticated(cx) {
+                        Some(model_provider.authenticate(cx))
+                    } else {
+                        None
+                    }
+                })? {
+                    task.await.log_err();
+                }
+
+                let mut diff_text = Self::run_gh_command(
+                    context.work_directory_abs_path.clone(),
+                    vec![
+                        "pr".into(),
+                        "diff".into(),
+                        pull_request.number.to_string(),
+                        "--patch".into(),
+                    ],
+                )
+                .await?;
+                const MAX_DIFF_BYTES: usize = 20_000;
+                diff_text = Self::compress_commit_diff(&diff_text, MAX_DIFF_BYTES);
+
+                let generated = Self::generate_pull_request_text(
+                    &model,
+                    temperature,
+                    pull_request.title.as_str(),
+                    pull_request.body.as_deref(),
+                    &diff_text,
+                    cx,
+                )
+                .await?;
+
+                Self::run_gh_command(
+                    context.work_directory_abs_path,
+                    vec![
+                        "pr".into(),
+                        "edit".into(),
+                        pull_request.number.to_string(),
+                        "--title".into(),
+                        generated.title.clone(),
+                        "--body".into(),
+                        generated.body.clone(),
+                    ],
+                )
+                .await?;
+
+                Ok(GhPullRequest {
+                    number: pull_request.number,
+                    title: generated.title,
+                    body: Some(generated.body),
+                    url: pull_request.url,
+                })
+            }
+            .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(updated_pull_request) => {
+                        this.pull_request_status = PullRequestStatus::Found(updated_pull_request);
+                    }
+                    Err(err) => {
+                        this.show_error_toast("update pull request", err, cx);
+                    }
+                }
+                this.update_pull_request_task = None;
+                cx.notify();
+                window.refresh();
+            })
+            .ok();
+        }));
+    }
+
+    async fn generate_created_pull_request_text(
+        repo: Entity<Repository>,
+        context: &GhPullRequestContext,
+        model: Option<ConfiguredModel>,
+        temperature: Option<f32>,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<GeneratedPullRequestText> {
+        let Some(ConfiguredModel {
+            provider: model_provider,
+            model,
+        }) = model
+        else {
+            anyhow::bail!("No commit message model configured");
+        };
+
+        if let Some(task) = cx.update(|_, cx| {
+            if !model_provider.is_authenticated(cx) {
+                Some(model_provider.authenticate(cx))
+            } else {
+                None
+            }
+        })? {
+            task.await.log_err();
+        }
+
+        let base_branch = Self::run_gh_command(
+            context.work_directory_abs_path.clone(),
+            vec![
+                "repo".into(),
+                "view".into(),
+                "--json".into(),
+                "defaultBranchRef".into(),
+                "--jq".into(),
+                ".defaultBranchRef.name".into(),
+            ],
+        )
+        .await?
+        .trim()
+        .to_string();
+
+        let mut diff_text = Self::diff_against_base_branch(repo, &base_branch, cx).await?;
+        const MAX_DIFF_BYTES: usize = 20_000;
+        diff_text = Self::compress_commit_diff(&diff_text, MAX_DIFF_BYTES);
+
+        let content = format!(
+            "Generate a GitHub pull request title and body for these branch changes.\n\
+            Focus on the substance of the change, not the git mechanics.\n\
+            Rules:\n\
+            - Write a concise, specific PR title.\n\
+            - The body should summarize what changed and any important reviewer context.\n\
+            - Mention notable user-visible behavior changes, refactors, fixes, or follow-up context when relevant.\n\
+            - Keep the body skimmable and avoid filler.\n\n\
+            Return only JSON in this exact shape: {{\"title\": string, \"body\": string}}.\n\n\
+            Branch changes:\n{diff_text}"
+        );
+
+        Self::generate_pull_request_text_from_prompt(&model, temperature, content, cx).await
+    }
+
+    async fn diff_against_base_branch(
+        repo: Entity<Repository>,
+        base_branch: &str,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<String> {
+        let origin_base_branch = format!("origin/{base_branch}");
+        let diff = repo.update(cx, |repo, cx| {
+            repo.diff(
+                DiffType::MergeBase {
+                    base_ref: origin_base_branch.clone().into(),
+                },
+                cx,
+            )
+        });
+
+        match diff.await? {
+            Ok(diff) => Ok(diff),
+            Err(origin_error) => {
+                let diff = repo.update(cx, |repo, cx| {
+                    repo.diff(
+                        DiffType::MergeBase {
+                            base_ref: base_branch.into(),
+                        },
+                        cx,
+                    )
+                });
+                diff.await?.with_context(|| {
+                    format!(
+                        "failed to diff against {origin_base_branch}; fallback to {base_branch} also failed: {origin_error}"
+                    )
+                })
+            }
+        }
+    }
+
+    async fn generate_pull_request_text(
+        model: &Arc<dyn language_model::LanguageModel>,
+        temperature: Option<f32>,
+        current_title: &str,
+        current_body: Option<&str>,
+        diff_text: &str,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<GeneratedPullRequestText> {
+        let current_body = current_body.unwrap_or_default();
+        let content = format!(
+            "You are updating a pull request title and description based on a git diff.\n\
+            Return only JSON in this exact shape: {{\"title\": string, \"body\": string}}.\n\
+            Keep the title concise and imperative. Keep the body useful and concise.\n\
+            Preserve any meaningful testing or release-note sections from the existing body if they are still relevant.\n\n\
+            Current title:\n{current_title}\n\n\
+            Current body:\n{current_body}\n\n\
+            Diff:\n{diff_text}"
+        );
+
+        Self::generate_pull_request_text_from_prompt(model, temperature, content, cx).await
+    }
+
+    async fn generate_pull_request_text_from_prompt(
+        model: &Arc<dyn language_model::LanguageModel>,
+        temperature: Option<f32>,
+        content: String,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<GeneratedPullRequestText> {
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: Some(CompletionIntent::GenerateGitCommitMessage),
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![content.into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature,
+            thinking_allowed: false,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let mut stream = model.stream_completion_text(request, cx).await?;
+        let mut response = String::new();
+        while let Some(text) = stream.stream.next().await {
+            response.push_str(&text?);
+        }
+
+        let response = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        serde_json::from_str(response).context("failed to parse generated pull request text")
+    }
+
+    fn current_pull_request(&self) -> Option<&GhPullRequest> {
+        match &self.pull_request_status {
+            PullRequestStatus::Found(pull_request) => Some(pull_request),
+            PullRequestStatus::Unknown
+            | PullRequestStatus::Loading
+            | PullRequestStatus::NotFound
+            | PullRequestStatus::Unsupported => None,
         }
     }
 
@@ -3811,6 +4313,7 @@ impl GitPanel {
             .and_then(|op| self.entry_by_path(&op.anchor));
 
         self.active_repository = self.project.read(cx).active_repository(cx);
+        self.update_pull_request_status(cx);
         self.entries.clear();
         self.entries_indices.clear();
         self.single_staged_entry.take();
@@ -4329,13 +4832,20 @@ impl GitPanel {
                                 })
                                 .ok();
                         }),
-                    PushPrLink { text, link } => this
-                        .icon(
+                    PushPrLink { text, link } => {
+                        drop(link);
+                        this.icon(
                             Icon::new(IconName::GitBranch)
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
-                        .action(text, move |_, cx| cx.open_url(&link)),
+                        .action(text, move |window, cx| {
+                            window.dispatch_action(
+                                zed_actions::git::CreatePullRequest.boxed_clone(),
+                                cx,
+                            )
+                        })
+                    }
                 }
                 .dismiss_button(true)
             });
@@ -4792,10 +5302,24 @@ impl GitPanel {
                         &branch,
                         focus_handle,
                         true,
+                        self.can_commit(),
+                        self.pull_request_menu_state(),
                     ))
                 })
                 .into_any_element(),
         )
+    }
+
+    fn pull_request_menu_state(&self) -> PullRequestMenuState {
+        let has_pull_request = self.current_pull_request().is_some();
+        let is_loading = matches!(self.pull_request_status, PullRequestStatus::Loading)
+            || self.update_pull_request_task.is_some();
+        let unsupported = matches!(self.pull_request_status, PullRequestStatus::Unsupported);
+
+        PullRequestMenuState {
+            can_create: !has_pull_request && !is_loading,
+            can_update: has_pull_request && !is_loading && !unsupported,
+        }
     }
 
     pub fn render_footer(

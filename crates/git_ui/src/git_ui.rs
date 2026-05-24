@@ -142,6 +142,15 @@ pub fn init(cx: &mut App) {
                     }
                 },
             );
+            workspace.register_action(
+                |workspace, _: &zed_actions::git::UpdatePullRequest, window, cx| {
+                    if let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.update_pull_request(window, cx);
+                        });
+                    }
+                },
+            );
             workspace.register_action(|workspace, _: &git::Fetch, window, cx| {
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
@@ -696,33 +705,63 @@ fn show_ref_picker(
     });
 }
 
+#[derive(Clone, Copy, Default)]
+struct PullRequestMenuState {
+    can_create: bool,
+    can_update: bool,
+}
+
 fn render_remote_button(
     id: impl Into<SharedString>,
     branch: &Branch,
     keybinding_target: Option<FocusHandle>,
     show_fetch_button: bool,
+    can_commit: bool,
+    pull_request_state: PullRequestMenuState,
 ) -> Option<impl IntoElement> {
     let id = id.into();
     let upstream = branch.upstream.as_ref();
+    let (ahead, behind) = match upstream {
+        Some(Upstream {
+            tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind }),
+            ..
+        }) => (*ahead, *behind),
+        _ => (0, 0),
+    };
+
+    if can_commit {
+        return Some(remote_button::render_commit_button(
+            keybinding_target,
+            id,
+            ahead,
+            behind,
+            pull_request_state,
+        ));
+    }
+
     match upstream {
         Some(Upstream {
             tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind }),
             ..
         }) => match (*ahead, *behind) {
-            (0, 0) if show_fetch_button => {
-                Some(remote_button::render_fetch_button(keybinding_target, id))
-            }
+            (0, 0) if show_fetch_button => Some(remote_button::render_fetch_button(
+                keybinding_target,
+                id,
+                pull_request_state,
+            )),
             (0, 0) => None,
             (ahead, 0) => Some(remote_button::render_push_button(
                 keybinding_target,
                 id,
                 ahead,
+                pull_request_state,
             )),
             (ahead, behind) => Some(remote_button::render_pull_button(
                 keybinding_target,
                 id,
                 ahead,
                 behind,
+                pull_request_state,
             )),
         },
         Some(Upstream {
@@ -731,12 +770,18 @@ fn render_remote_button(
         }) => Some(remote_button::render_republish_button(
             keybinding_target,
             id,
+            pull_request_state,
         )),
-        None => Some(remote_button::render_publish_button(keybinding_target, id)),
+        None => Some(remote_button::render_publish_button(
+            keybinding_target,
+            id,
+            pull_request_state,
+        )),
     }
 }
 
 mod remote_button {
+    use super::PullRequestMenuState;
     use gpui::{Action, Anchor, AnyView, ClickEvent, FocusHandle};
     use ui::{
         App, ButtonCommon, Clickable, ContextMenu, ElementId, FluentBuilder, Icon, IconName,
@@ -744,15 +789,36 @@ mod remote_button {
         PopoverMenu, SharedString, SplitButton, Styled, Tooltip, Window, div, h_flex, rems,
     };
 
+    #[derive(Clone, Copy, Default)]
+    struct RemoteCounts {
+        ahead: usize,
+        behind: usize,
+    }
+
+    impl RemoteCounts {
+        fn new(ahead: u32, behind: u32) -> Self {
+            Self {
+                ahead: ahead as usize,
+                behind: behind as usize,
+            }
+        }
+
+        fn is_empty(self) -> bool {
+            self.ahead == 0 && self.behind == 0
+        }
+    }
+
     pub fn render_fetch_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        pull_request_state: PullRequestMenuState,
     ) -> SplitButton {
         split_button(
             id,
             "Fetch",
-            0,
-            0,
+            RemoteCounts::default(),
+            RemoteCounts::default(),
+            pull_request_state,
             Some(IconName::ArrowCircle),
             keybinding_target.clone(),
             move |_, window, cx| {
@@ -770,16 +836,48 @@ mod remote_button {
         )
     }
 
+    pub fn render_commit_button(
+        keybinding_target: Option<FocusHandle>,
+        id: SharedString,
+        ahead: u32,
+        behind: u32,
+        pull_request_state: PullRequestMenuState,
+    ) -> SplitButton {
+        split_button(
+            id,
+            "Commit",
+            RemoteCounts::default(),
+            RemoteCounts::new(ahead, behind),
+            pull_request_state,
+            None,
+            keybinding_target.clone(),
+            move |_, window, cx| {
+                window.dispatch_action(Box::new(git::GenerateCommitMessageAndCommit), cx);
+            },
+            move |_window, cx| {
+                git_action_tooltip(
+                    "Generate a commit message and commit changes",
+                    &git::GenerateCommitMessageAndCommit,
+                    "git commit",
+                    keybinding_target.clone(),
+                    cx,
+                )
+            },
+        )
+    }
+
     pub fn render_push_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
         ahead: u32,
+        pull_request_state: PullRequestMenuState,
     ) -> SplitButton {
         split_button(
             id,
             "Push",
-            ahead as usize,
-            0,
+            RemoteCounts::new(ahead, 0),
+            RemoteCounts::new(ahead, 0),
+            pull_request_state,
             None,
             keybinding_target.clone(),
             move |_, window, cx| {
@@ -802,12 +900,14 @@ mod remote_button {
         id: SharedString,
         ahead: u32,
         behind: u32,
+        pull_request_state: PullRequestMenuState,
     ) -> SplitButton {
         split_button(
             id,
             "Pull",
-            ahead as usize,
-            behind as usize,
+            RemoteCounts::new(ahead, behind),
+            RemoteCounts::new(ahead, behind),
+            pull_request_state,
             None,
             keybinding_target.clone(),
             move |_, window, cx| {
@@ -828,12 +928,14 @@ mod remote_button {
     pub fn render_publish_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        pull_request_state: PullRequestMenuState,
     ) -> SplitButton {
         split_button(
             id,
             "Publish",
-            0,
-            0,
+            RemoteCounts::default(),
+            RemoteCounts::default(),
+            pull_request_state,
             Some(IconName::ExpandUp),
             keybinding_target.clone(),
             move |_, window, cx| {
@@ -854,12 +956,14 @@ mod remote_button {
     pub fn render_republish_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        pull_request_state: PullRequestMenuState,
     ) -> SplitButton {
         split_button(
             id,
             "Republish",
-            0,
-            0,
+            RemoteCounts::default(),
+            RemoteCounts::default(),
+            pull_request_state,
             Some(IconName::ExpandUp),
             keybinding_target.clone(),
             move |_, window, cx| {
@@ -896,8 +1000,18 @@ mod remote_button {
 
     fn render_git_action_menu(
         id: impl Into<ElementId>,
+        counts: RemoteCounts,
+        pull_request_state: PullRequestMenuState,
         keybinding_target: Option<FocusHandle>,
     ) -> impl IntoElement {
+        fn label_with_count(label: &str, count: usize) -> String {
+            if count > 0 {
+                format!("{label} ({count})")
+            } else {
+                label.to_string()
+            }
+        }
+
         PopoverMenu::new(id.into())
             .trigger(
                 ui::ButtonLike::new_rounded_right("split-button-right")
@@ -923,12 +1037,32 @@ mod remote_button {
                         .separator()
                         .action("Fetch", git::Fetch.boxed_clone())
                         .action("Fetch From", git::FetchFrom.boxed_clone())
-                        .action("Pull", git::Pull.boxed_clone())
-                        .action("Pull (Rebase)", git::PullRebase.boxed_clone())
+                        .action(
+                            label_with_count("Pull", counts.behind),
+                            git::Pull.boxed_clone(),
+                        )
+                        .action(
+                            label_with_count("Pull (Rebase)", counts.behind),
+                            git::PullRebase.boxed_clone(),
+                        )
                         .separator()
-                        .action("Push", git::Push.boxed_clone())
+                        .action(
+                            label_with_count("Push", counts.ahead),
+                            git::Push.boxed_clone(),
+                        )
                         .action("Push To", git::PushTo.boxed_clone())
                         .action("Force Push", git::ForcePush.boxed_clone())
+                        .separator()
+                        .action_disabled_when(
+                            !pull_request_state.can_create,
+                            "Create PR",
+                            zed_actions::git::CreatePullRequest.boxed_clone(),
+                        )
+                        .action_disabled_when(
+                            !pull_request_state.can_update,
+                            "Update PR",
+                            zed_actions::git::UpdatePullRequest.boxed_clone(),
+                        )
                 }))
             })
             .anchor(Anchor::TopRight)
@@ -938,8 +1072,9 @@ mod remote_button {
     fn split_button(
         id: SharedString,
         left_label: impl Into<SharedString>,
-        ahead_count: usize,
-        behind_count: usize,
+        left_counts: RemoteCounts,
+        menu_counts: RemoteCounts,
+        pull_request_state: PullRequestMenuState,
         left_icon: Option<IconName>,
         keybinding_target: Option<FocusHandle>,
         left_on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -959,7 +1094,7 @@ mod remote_button {
                 )
         }
 
-        let should_render_counts = left_icon.is_none() && (ahead_count > 0 || behind_count > 0);
+        let should_render_counts = left_icon.is_none() && !left_counts.is_empty();
 
         let left = ui::ButtonLike::new_rounded_left(ElementId::Name(
             format!("split-button-left-{}", id).into(),
@@ -970,13 +1105,13 @@ mod remote_button {
             this.child(
                 h_flex()
                     .ml_neg_0p5()
-                    .when(behind_count > 0, |this| {
+                    .when(left_counts.behind > 0, |this| {
                         this.child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
-                            .child(count(behind_count))
+                            .child(count(left_counts.behind))
                     })
-                    .when(ahead_count > 0, |this| {
+                    .when(left_counts.ahead > 0, |this| {
                         this.child(Icon::new(IconName::ArrowUp).size(IconSize::XSmall))
-                            .child(count(ahead_count))
+                            .child(count(left_counts.ahead))
                     }),
             )
         })
@@ -997,6 +1132,8 @@ mod remote_button {
 
         let right = render_git_action_menu(
             ElementId::Name(format!("split-button-right-{}", id).into()),
+            menu_counts,
+            pull_request_state,
             keybinding_target,
         )
         .into_any_element();
