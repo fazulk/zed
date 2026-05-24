@@ -8,6 +8,7 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+fast_dmg=false
 
 # This must match the team in the provisioning profile.
 IDENTITY="Zed Industries, Inc."
@@ -21,13 +22,14 @@ Build the application bundle for macOS.
 
 Options:
   -d    Compile in debug mode
+  -f    Fast local DMG: skip license generation, DMG license agreement, Sentry symbols, notarization, and high compression.
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dfloih' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -37,6 +39,7 @@ do
             build_flag="";
             target_dir="debug"
             ;;
+        f) fast_dmg=true;;
         i) local_install=true;;
         h)
            help_info
@@ -81,8 +84,13 @@ else
     exit 1
 fi
 
-# Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+# Generate the licenses first, so they can be baked into the binaries.
+# Fast local DMG builds reuse the existing generated file to avoid spending time here.
+if [[ "$fast_dmg" = true && -f assets/licenses.md ]]; then
+    echo "Fast DMG build: reusing existing assets/licenses.md"
+else
+    script/generate-licenses
+fi
 
 rustup target add $target_triple
 
@@ -198,7 +206,7 @@ function sign_app_binaries() {
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
     cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
 
-    if [[ $can_code_sign = true ]]; then
+    if [[ $can_code_sign = true && "$fast_dmg" = false ]]; then
         echo "Code signing binaries"
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
@@ -251,26 +259,34 @@ function sign_app_binaries() {
         rm -rf ${dmg_source_directory}
         mkdir -p ${dmg_source_directory}
         mv "${app_path}" "${dmg_source_directory}"
-        notarization_key_file=$(mktemp)
 
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
         ln -s /Applications ${dmg_source_directory}
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        dmg_format="UDZO"
+        if [[ "$fast_dmg" = true ]]; then
+            dmg_format="UDRW"
+        fi
+        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format "$dmg_format" "${dmg_file_path}"
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
         rm ${dmg_source_directory}/Applications
 
-        echo "Adding license agreement to DMG"
-        npm install --global dmg-license minimist
-        dmg-license script/terms/terms.json "${dmg_file_path}"
+        if [[ "$fast_dmg" = true ]]; then
+            echo "Fast DMG build: skipping DMG license agreement"
+        else
+            echo "Adding license agreement to DMG"
+            npm install --global dmg-license minimist
+            dmg-license script/terms/terms.json "${dmg_file_path}"
+        fi
 
-        if [[ $can_code_sign = true ]]; then
+        if [[ $can_code_sign = true && "$fast_dmg" = false ]]; then
             echo "Notarizing DMG with Apple"
             /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
+            notarization_key_file=$(mktemp)
             echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
             "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
             rm "$notarization_key_file"
@@ -286,14 +302,16 @@ function sign_app_binaries() {
 function sign_binary() {
     local binary_path=$1
 
-    if [[ $can_code_sign = true ]]; then
+    if [[ $can_code_sign = true && "$fast_dmg" = false ]]; then
         echo "Code signing executable $binary_path"
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${binary_path}" -v
     fi
 }
 
 function upload_debug_symbols() {
-    if [ "$local_install" = true ]; then
+    if [[ "$fast_dmg" = true ]]; then
+        echo "Fast DMG build: skipping sentry upload."
+    elif [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
@@ -337,4 +355,8 @@ cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ "$fast_dmg" = true ]]; then
+    gzip -f --stdout -1 target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+else
+    gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+fi

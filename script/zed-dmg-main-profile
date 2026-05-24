@@ -10,6 +10,6 @@ if [ ! -e target ]; then
     ln -s "$CARGO_TARGET_DIR" target
 fi
 
-script/bundle-mac aarch64-apple-darwin
+script/bundle-mac -f aarch64-apple-darwin
 
 open "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/Zed-aarch64.dmg"
