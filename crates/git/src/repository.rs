@@ -2445,7 +2445,7 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
-            let mut command = git.build_command(&["pull"]);
+            let mut command = git.build_command(&["pull", "--prune"]);
             command.envs(env.iter());
 
             if rebase {
@@ -2487,7 +2487,7 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
-            let mut command = git.build_command(&["fetch", &remote_name]);
+            let mut command = git.build_command(&["fetch", "--prune", &remote_name]);
             command
                 .envs(env.iter())
                 .stdout(Stdio::piped())
@@ -3699,6 +3699,22 @@ mod tests {
         }
     }
 
+    async fn run_git(
+        working_directory: &Path,
+        args: &[&str],
+        cx: &mut TestAppContext,
+    ) -> Result<String> {
+        GitBinary::new(
+            PathBuf::from("git"),
+            working_directory.to_path_buf(),
+            working_directory.join(".git"),
+            cx.executor(),
+            true,
+        )
+        .run(args)
+        .await
+    }
+
     #[test]
     fn test_initial_graph_commit_data_tag_names() {
         let commit = InitialGraphCommitData {
@@ -4189,6 +4205,107 @@ mod tests {
                 }
             ]
         )
+    }
+
+    #[gpui::test]
+    async fn test_pull_prunes_deleted_upstream_branch(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let root = tempfile::tempdir().unwrap();
+        run_git(root.path(), &["init", "--bare", "remote.git"], cx)
+            .await
+            .unwrap();
+
+        let remote_path = root.path().join("remote.git");
+        let remote_path = remote_path.to_str().unwrap();
+        run_git(root.path(), &["clone", remote_path, "source"], cx)
+            .await
+            .unwrap();
+
+        let source = root.path().join("source");
+        run_git(&source, &["config", "user.email", "zed@example.com"], cx)
+            .await
+            .unwrap();
+        run_git(&source, &["config", "user.name", "Zed"], cx)
+            .await
+            .unwrap();
+        smol::fs::write(source.join("file"), "initial")
+            .await
+            .unwrap();
+        run_git(&source, &["add", "file"], cx).await.unwrap();
+        run_git(&source, &["commit", "-m", "initial"], cx)
+            .await
+            .unwrap();
+        run_git(&source, &["push", "-u", "origin", "HEAD:zednew"], cx)
+            .await
+            .unwrap();
+
+        run_git(
+            root.path(),
+            &["clone", "--branch", "zednew", remote_path, "checkout"],
+            cx,
+        )
+        .await
+        .unwrap();
+        let checkout = root.path().join("checkout");
+
+        smol::fs::write(source.join("file"), "initial\nsecond")
+            .await
+            .unwrap();
+        run_git(&source, &["commit", "-am", "second"], cx)
+            .await
+            .unwrap();
+        run_git(&source, &["push", "origin", "HEAD:zednew"], cx)
+            .await
+            .unwrap();
+        run_git(&checkout, &["fetch", "origin"], cx).await.unwrap();
+        run_git(&source, &["push", "origin", "--delete", "zednew"], cx)
+            .await
+            .unwrap();
+
+        let repo = RealGitRepository::new(
+            &checkout.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let branch = repo
+            .branches()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.is_head)
+            .unwrap();
+        assert_eq!(
+            branch.upstream.unwrap().tracking,
+            UpstreamTracking::Tracked(UpstreamTrackingStatus {
+                ahead: 0,
+                behind: 1
+            })
+        );
+
+        let result = repo
+            .pull(
+                None,
+                "origin".into(),
+                false,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(HashMap::default()),
+                cx.to_async(),
+            )
+            .await;
+        assert!(result.is_err());
+
+        let branch = repo
+            .branches()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.is_head)
+            .unwrap();
+        assert_eq!(branch.upstream.unwrap().tracking, UpstreamTracking::Gone);
     }
 
     #[test]

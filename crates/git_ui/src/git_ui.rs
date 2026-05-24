@@ -784,9 +784,10 @@ mod remote_button {
     use super::PullRequestMenuState;
     use gpui::{Action, Anchor, AnyView, ClickEvent, FocusHandle};
     use ui::{
-        App, ButtonCommon, Clickable, ContextMenu, ElementId, FluentBuilder, Icon, IconName,
-        IconSize, IntoElement, Label, LabelCommon, LabelSize, LineHeightStyle, ParentElement,
-        PopoverMenu, SharedString, SplitButton, Styled, Tooltip, Window, div, h_flex, rems,
+        App, ButtonCommon, Clickable, ContextMenu, ContextMenuEntry, ElementId, FluentBuilder,
+        Icon, IconName, IconSize, IntoElement, Label, LabelCommon, LabelSize, LineHeightStyle,
+        ParentElement, PopoverMenu, SharedString, SplitButton, Styled, Tooltip, Window, div,
+        h_flex, rems,
     };
 
     #[derive(Clone, Copy, Default)]
@@ -1012,6 +1013,20 @@ mod remote_button {
             }
         }
 
+        fn pull_request_action_entry(
+            label: &str,
+            disabled: bool,
+            action: Box<dyn Action>,
+        ) -> ContextMenuEntry {
+            let action_for_handler = action.boxed_clone();
+            ContextMenuEntry::new(label)
+                .action(action)
+                .disabled(disabled)
+                .handler(move |window, cx| {
+                    window.dispatch_action(action_for_handler.boxed_clone(), cx);
+                })
+        }
+
         PopoverMenu::new(id.into())
             .trigger(
                 ui::ButtonLike::new_rounded_right("split-button-right")
@@ -1053,16 +1068,16 @@ mod remote_button {
                         .action("Push To", git::PushTo.boxed_clone())
                         .action("Force Push", git::ForcePush.boxed_clone())
                         .separator()
-                        .action_disabled_when(
-                            !pull_request_state.can_create,
+                        .item(pull_request_action_entry(
                             "Create PR",
+                            !pull_request_state.can_create,
                             zed_actions::git::CreatePullRequest.boxed_clone(),
-                        )
-                        .action_disabled_when(
-                            !pull_request_state.can_update,
+                        ))
+                        .item(pull_request_action_entry(
                             "Update PR",
+                            !pull_request_state.can_update,
                             zed_actions::git::UpdatePullRequest.boxed_clone(),
-                        )
+                        ))
                 }))
             })
             .anchor(Anchor::TopRight)

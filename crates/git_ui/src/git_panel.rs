@@ -2452,6 +2452,20 @@ impl GitPanel {
             self.fill_co_authors(&mut message, cx);
         }
 
+        let success_message = if options.amend {
+            "Commit amended"
+        } else {
+            "Commit created"
+        };
+        self.show_git_operation_toast(
+            if options.amend {
+                "Amending commit"
+            } else {
+                "Committing changes"
+            },
+            cx,
+        );
+
         let task = if self.has_staged_changes() {
             // Repository serializes all git operations, so we can just send a commit immediately
             let commit_task = active_repository.update(cx, |repo, cx| {
@@ -2490,6 +2504,8 @@ impl GitPanel {
 
                         if push_after_commit {
                             this.push(false, false, window, cx);
+                        } else {
+                            this.show_git_success_toast(success_message, cx);
                         }
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
@@ -2876,6 +2892,10 @@ impl GitPanel {
         let project = self.project.clone();
         let repo_work_dir = repo.read(cx).work_directory_abs_path.clone();
 
+        if push_after_generate.is_some() {
+            self.show_git_operation_toast("Generating commit message", cx);
+        }
+
         self.generate_commit_message_task = Some(cx.spawn(async move |this, mut cx| {
              async move {
                 let _defer = cx.on_drop(&this, |this, _cx| {
@@ -3074,6 +3094,7 @@ impl GitPanel {
             return;
         };
         telemetry::event!("Git Fetched");
+        self.show_git_operation_toast("Fetching remotes", cx);
         let askpass = self.askpass_delegate("git fetch", window, cx);
         let this = cx.weak_entity();
 
@@ -3220,6 +3241,14 @@ impl GitPanel {
         };
         telemetry::event!("Git Pulled");
         let branch = branch.clone();
+        self.show_git_operation_toast(
+            if rebase {
+                "Rebasing branch"
+            } else {
+                "Pulling changes"
+            },
+            cx,
+        );
         let remote = self.get_remote(false, false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let remote = match remote.await {
@@ -3297,6 +3326,15 @@ impl GitPanel {
             }
         };
         let remote = self.get_remote(select_remote, true, window, cx);
+
+        self.show_git_operation_toast(
+            if force_push {
+                "Force pushing changes"
+            } else {
+                "Pushing changes"
+            },
+            cx,
+        );
 
         cx.spawn_in(window, async move |this, cx| {
             let remote = match remote.await {
@@ -3564,6 +3602,30 @@ impl GitPanel {
         Ok(pull_requests.pop())
     }
 
+    async fn update_pull_request_with_gh(
+        work_directory_abs_path: Arc<Path>,
+        number: u32,
+        title: String,
+        body: String,
+    ) -> anyhow::Result<()> {
+        Self::run_gh_command(
+            work_directory_abs_path,
+            vec![
+                "api".into(),
+                "--method".into(),
+                "PATCH".into(),
+                format!("repos/{{owner}}/{{repo}}/pulls/{number}"),
+                "--raw-field".into(),
+                format!("title={title}"),
+                "--raw-field".into(),
+                format!("body={body}"),
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
     async fn run_gh_command(
         work_directory_abs_path: Arc<Path>,
         args: Vec<String>,
@@ -3623,13 +3685,46 @@ impl GitPanel {
     }
 
     fn show_pull_request_created_toast(&self, pull_request: &GhPullRequest, cx: &mut App) {
+        self.show_pull_request_complete_toast("Pull request created", pull_request, cx);
+    }
+
+    fn show_pull_request_updating_toast(&self, cx: &mut App) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new("Updating pull request", cx, |this, _cx| {
+                    this.icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .dismiss_button(true)
+                });
+                workspace.toggle_status_toast(toast, cx)
+            });
+        });
+    }
+
+    fn show_pull_request_updated_toast(&self, pull_request: &GhPullRequest, cx: &mut App) {
+        self.show_pull_request_complete_toast("Pull request updated", pull_request, cx);
+    }
+
+    fn show_pull_request_complete_toast(
+        &self,
+        message: impl Into<SharedString>,
+        pull_request: &GhPullRequest,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let message = message.into();
         let pull_request_url = pull_request.url.clone();
         cx.defer(move |cx| {
             workspace.update(cx, |workspace, cx| {
-                let toast = StatusToast::new("Pull request created", cx, move |this, _cx| {
+                let toast = StatusToast::new(message.clone(), cx, move |this, _cx| {
                     let this = this
                         .icon(
                             Icon::new(IconName::GitBranch)
@@ -3667,6 +3762,7 @@ impl GitPanel {
             AgentSettings::temperature_for_model(model, cx)
         });
 
+        self.show_pull_request_updating_toast(cx);
         self.update_pull_request_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = async {
                 let Some(ConfiguredModel {
@@ -3710,17 +3806,11 @@ impl GitPanel {
                 )
                 .await?;
 
-                Self::run_gh_command(
+                Self::update_pull_request_with_gh(
                     context.work_directory_abs_path,
-                    vec![
-                        "pr".into(),
-                        "edit".into(),
-                        pull_request.number.to_string(),
-                        "--title".into(),
-                        generated.title.clone(),
-                        "--body".into(),
-                        generated.body.clone(),
-                    ],
+                    pull_request.number,
+                    generated.title.clone(),
+                    generated.body.clone(),
                 )
                 .await?;
 
@@ -3736,6 +3826,7 @@ impl GitPanel {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(updated_pull_request) => {
+                        this.show_pull_request_updated_toast(&updated_pull_request, cx);
                         this.pull_request_status = PullRequestStatus::Found(updated_pull_request);
                     }
                     Err(err) => {
@@ -4684,6 +4775,36 @@ impl GitPanel {
         show_error_toast(workspace, action, e, cx)
     }
 
+    fn show_git_operation_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
+        self.show_git_status_toast(message, IconName::GitBranch, Color::Muted, cx);
+    }
+
+    fn show_git_success_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
+        self.show_git_status_toast(message, IconName::Check, Color::Success, cx);
+    }
+
+    fn show_git_status_toast(
+        &self,
+        message: impl Into<SharedString>,
+        icon_name: IconName,
+        icon_color: Color,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let message = message.into();
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new(message.clone(), cx, move |this, _cx| {
+                    this.icon(Icon::new(icon_name).size(IconSize::Small).color(icon_color))
+                        .dismiss_button(true)
+                });
+                workspace.toggle_status_toast(toast, cx)
+            });
+        });
+    }
+
     fn show_git_job_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.active_repository.as_ref() else {
             let workspace = self.workspace.clone();
@@ -4778,7 +4899,7 @@ impl GitPanel {
         E: std::fmt::Debug + std::fmt::Display,
     {
         if let Ok(Some(workspace)) = weak_this.update(cx, |this, _cx| this.workspace.upgrade()) {
-            let _ = workspace.update(cx, |workspace, cx| {
+            workspace.update(cx, |workspace, cx| {
                 struct CommitMessageError;
                 let notification_id = NotificationId::unique::<CommitMessageError>();
                 workspace.show_notification(notification_id, cx, |cx| {
@@ -4789,6 +4910,16 @@ impl GitPanel {
                         )
                     })
                 });
+                let toast =
+                    StatusToast::new("Commit message generation failed", cx, |this, _cx| {
+                        this.icon(
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
+                        .dismiss_button(true)
+                    });
+                workspace.toggle_status_toast(toast, cx)
             });
         }
     }
@@ -5306,6 +5437,25 @@ impl GitPanel {
                         self.pull_request_menu_state(),
                     ))
                 })
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn render_pull_request_link(&self) -> Option<AnyElement> {
+        let pull_request = self.current_pull_request()?;
+        let url = pull_request.url.clone()?;
+        let number = pull_request.number;
+        let title = pull_request.title.clone();
+        let tooltip = format!("Open pull request #{number}: {title}");
+
+        Some(
+            Button::new(format!("pull-request-{number}"), format!("#{number}"))
+                .size(ButtonSize::None)
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Transparent)
+                .color(Color::Accent)
+                .tooltip(move |_, cx| Tooltip::simple(tooltip.clone(), cx))
+                .on_click(move |_, _, cx| cx.open_url(&url))
                 .into_any_element(),
         )
     }
@@ -7795,6 +7945,10 @@ impl RenderOnce for PanelRepoFooter {
                 y: px(-2.0),
             });
 
+        let pull_request_link = self.git_panel.as_ref().and_then(|git_panel| {
+            git_panel.update(cx, |git_panel, _cx| git_panel.render_pull_request_link())
+        });
+
         h_flex()
             .h_9()
             .w_full()
@@ -7823,7 +7977,18 @@ impl RenderOnce for PanelRepoFooter {
                             },
                         )
                     })
-                    .child(div().child(branch_selector).min_w_0()),
+                    .child(div().child(branch_selector).min_w_0())
+                    .when_some(pull_request_link, |this, pull_request_link| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_px()
+                                .child(Label::new("/").size(LabelSize::Small).color(Color::Custom(
+                                    cx.theme().colors().text_muted.opacity(0.4),
+                                )))
+                                .child(pull_request_link),
+                        )
+                    }),
             )
             .children(if let Some(git_panel) = self.git_panel {
                 git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
