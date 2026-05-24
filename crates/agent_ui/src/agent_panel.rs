@@ -1,6 +1,7 @@
 use std::{
     fmt,
     path::PathBuf,
+    process::ExitStatus,
     rc::Rc,
     sync::{
         Arc,
@@ -75,8 +76,12 @@ use prompt_store::PromptStore;
 use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 use skill_creator::open_skill_creator;
+use task::{RevealStrategy, Shell, SpawnInTerminal};
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use terminal_view::{
+    TerminalView,
+    terminal_panel::{TerminalPanel, prepare_task_for_spawn},
+};
 use theme_settings::ThemeSettings;
 use ui::{
     Button, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
@@ -252,6 +257,7 @@ struct SerializedActiveThread {
 pub fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
+            workspace.set_sidebar_task_provider(SidebarTaskProvider(workspace.weak_handle()));
             workspace
                 .register_action(|workspace, _: &NewThread, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
@@ -909,6 +915,22 @@ pub struct AgentPanel {
     is_active: bool,
 }
 
+fn prepare_task_for_sidebar_spawn(
+    task: &SpawnInTerminal,
+    remote_shell: Option<String>,
+    is_windows: bool,
+) -> SpawnInTerminal {
+    let shell = if let Some(remote_shell) = remote_shell
+        && task.shell == Shell::System
+    {
+        Shell::Program(remote_shell)
+    } else {
+        task.shell.clone()
+    };
+
+    prepare_task_for_spawn(task, &shell, is_windows)
+}
+
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
@@ -1129,6 +1151,7 @@ impl AgentPanel {
 
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, prompt_store, window, cx));
+                workspace.set_sidebar_task_provider(SidebarTaskProvider(workspace.weak_handle()));
 
                 panel.update(cx, |panel, cx| {
                     let is_via_collab = panel.project.read(cx).is_via_collab();
@@ -1684,6 +1707,119 @@ impl AgentPanel {
             window,
             cx,
         );
+    }
+
+    pub fn spawn_task(
+        &mut self,
+        task: SpawnInTerminal,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Result<ExitStatus>>> {
+        if !self.supports_terminal(cx) {
+            return Task::ready(None);
+        }
+
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+
+        let task = {
+            let project = self.project.read(cx);
+            let remote_shell = project
+                .remote_client()
+                .as_ref()
+                .and_then(|remote_client| remote_client.read(cx).shell());
+            prepare_task_for_sidebar_spawn(&task, remote_shell, project.path_style(cx).is_windows())
+        };
+
+        let terminal_id = TerminalId::new();
+        let reveal = task.reveal;
+        let focus = matches!(reveal, RevealStrategy::Always);
+        let select = !matches!(reveal, RevealStrategy::Never);
+        let custom_title = SharedString::from(task.label.clone());
+        let workspace_for_cwd = self.workspace.upgrade();
+        let working_directory = task.cwd.clone().or_else(|| {
+            workspace_for_cwd.as_ref().and_then(|workspace| {
+                workspace.read_with(cx, |workspace, cx| {
+                    self.terminal_working_directory(Some(workspace), cx)
+                })
+            })
+        });
+
+        self.pending_terminal_spawn = Some(terminal_id);
+
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        let workspace_id = self.workspace_id;
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = project
+                .update(cx, |project, cx| project.create_terminal_task(task, cx))
+                .await;
+
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    log::error!("failed to spawn sidebar task terminal: {error:#}");
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_error(&error, cx))
+                        .log_err();
+                    this.update(cx, |this, cx| {
+                        if this.pending_terminal_spawn == Some(terminal_id) {
+                            this.pending_terminal_spawn = None;
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                    return Some(Err(error));
+                }
+            };
+
+            let terminal_entity = terminal.clone();
+            if this
+                .update_in(cx, |this, window, cx| {
+                    let terminal_view = cx.new(|cx| {
+                        TerminalView::new(
+                            terminal,
+                            workspace.clone(),
+                            workspace_id,
+                            project.downgrade(),
+                            window,
+                            cx,
+                        )
+                    });
+                    this.insert_terminal(
+                        terminal_id,
+                        terminal_view,
+                        working_directory,
+                        Some(custom_title),
+                        None,
+                        None,
+                        select,
+                        focus,
+                        source,
+                        window,
+                        cx,
+                    );
+                    anyhow::Ok(())
+                })
+                .is_err()
+            {
+                return None;
+            }
+
+            if focus {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    })
+                    .log_err();
+            }
+
+            let exit_status = terminal_entity
+                .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+                .await?;
+            Some(Ok(exit_status))
+        })
     }
 
     fn terminal_working_directory(
@@ -6115,6 +6251,50 @@ impl AgentPanel {
     }
 }
 
+struct SidebarTaskProvider(WeakEntity<Workspace>);
+
+impl workspace::SidebarTaskProvider for SidebarTaskProvider {
+    fn spawn(
+        &self,
+        task: SpawnInTerminal,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Option<Result<ExitStatus>>> {
+        let workspace = self.0.clone();
+        let mut async_window_cx = window.to_async(cx);
+        window.spawn(cx, async move |cx| {
+            let panel =
+                match workspace.update(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx)) {
+                    Ok(Some(panel)) => panel,
+                    Ok(None) => {
+                        let panel = AgentPanel::load(workspace.clone(), async_window_cx.clone())
+                            .await
+                            .log_err()?;
+                        workspace
+                            .update_in(&mut async_window_cx, |workspace, window, cx| {
+                                workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                                    workspace.add_panel(panel.clone(), window, cx);
+                                    panel.clone()
+                                })
+                            })
+                            .log_err()?
+                    }
+                    Err(error) => {
+                        log::debug!("failed to load sidebar task provider workspace: {error:#}");
+                        return None;
+                    }
+                };
+
+            panel
+                .update_in(cx, |panel, window, cx| {
+                    panel.spawn_task(task, AgentThreadSource::AgentPanel, window, cx)
+                })
+                .ok()?
+                .await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6138,6 +6318,40 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Instant;
+
+    #[test]
+    fn prepares_sidebar_task_with_remote_shell() {
+        let task = SpawnInTerminal {
+            command: Some("echo hi".to_string()),
+            shell: Shell::System,
+            ..Default::default()
+        };
+
+        let task = prepare_task_for_sidebar_spawn(&task, Some("/bin/bash".to_string()), false);
+
+        assert_eq!(task.command, Some("/bin/bash".to_string()));
+        assert_eq!(
+            task.args,
+            vec!["-i".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepares_sidebar_task_prefers_configured_task_shell() {
+        let task = SpawnInTerminal {
+            command: Some("echo hi".to_string()),
+            shell: Shell::Program("/bin/zsh".to_string()),
+            ..Default::default()
+        };
+
+        let task = prepare_task_for_sidebar_spawn(&task, Some("/bin/bash".to_string()), false);
+
+        assert_eq!(task.command, Some("/bin/zsh".to_string()));
+        assert_eq!(
+            task.args,
+            vec!["-i".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
+    }
 
     #[derive(Clone, Default)]
     struct SessionTrackingConnection {

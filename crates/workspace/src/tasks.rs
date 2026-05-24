@@ -7,13 +7,29 @@ use language::Buffer;
 use project::{TaskSourceKind, WorktreeId};
 use remote::ConnectionState;
 use task::{
-    DebugScenario, ResolvedTask, SaveStrategy, SharedTaskContext, SpawnInTerminal, TaskContext,
-    TaskHook, TaskTemplate, TaskVariables, VariableName,
+    DebugScenario, ResolvedTask, RevealStrategy, RevealTarget, SaveStrategy, SharedTaskContext,
+    SpawnInTerminal, TaskContext, TaskHook, TaskTemplate, TaskVariables, VariableName,
 };
 use ui::Window;
 use util::TryFutureExt;
 
 use crate::{SaveIntent, Toast, Workspace, notifications::NotificationId};
+
+fn show_task_toast(
+    workspace: &WeakEntity<Workspace>,
+    message: String,
+    autohide: bool,
+    cx: &mut AsyncWindowContext,
+) {
+    if let Err(error) = workspace.update(cx, |workspace, cx| {
+        let id = NotificationId::unique::<ResolvedTask>();
+        let toast = Toast::new(id, message);
+        let toast = if autohide { toast.autohide() } else { toast };
+        workspace.show_toast(toast, cx);
+    }) {
+        log::debug!("failed to show task toast: {error:#}");
+    }
+}
 
 impl Workspace {
     pub fn schedule_task(
@@ -60,6 +76,8 @@ impl Workspace {
         cx: &mut Context<Workspace>,
     ) {
         let spawn_in_terminal = resolved_task.resolved.clone();
+        let show_completion_toast = spawn_in_terminal.reveal == RevealStrategy::Never;
+        let task_label = spawn_in_terminal.label.clone();
         if !omit_history {
             if let Some(debugger_provider) = self.debugger_provider.as_ref() {
                 debugger_provider.task_scheduled(cx);
@@ -76,7 +94,66 @@ impl Workspace {
             });
         }
 
-        if self.terminal_provider.is_some() {
+        if spawn_in_terminal.reveal_target == RevealTarget::Sidebar {
+            if self.sidebar_task_provider.is_some() {
+                let task = cx.spawn_in(window, async move |workspace, cx| {
+                    Self::save_for_task(&workspace, spawn_in_terminal.save, cx).await;
+
+                    let spawn_task = workspace.update_in(cx, |workspace, window, cx| {
+                        workspace
+                            .sidebar_task_provider
+                            .as_ref()
+                            .map(|sidebar_task_provider| {
+                                sidebar_task_provider.spawn(spawn_in_terminal, window, cx)
+                            })
+                    });
+                    if let Some(spawn_task) = spawn_task.ok().flatten() {
+                        let res = cx.background_spawn(spawn_task).await;
+                        match res {
+                            Some(Ok(status)) => {
+                                if status.success() {
+                                    log::debug!("Task spawn succeeded");
+                                    if show_completion_toast {
+                                        show_task_toast(
+                                            &workspace,
+                                            format!("Task `{task_label}` succeeded"),
+                                            true,
+                                            cx,
+                                        );
+                                    }
+                                } else {
+                                    log::debug!("Task spawn failed, code: {:?}", status.code());
+                                    if show_completion_toast {
+                                        let message = match status.code() {
+                                            Some(code) => format!(
+                                                "Task `{task_label}` failed with exit code {code}"
+                                            ),
+                                            None => format!("Task `{task_label}` failed"),
+                                        };
+                                        show_task_toast(&workspace, message, true, cx);
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                log::error!("Task spawn failed: {e:#}");
+                                show_task_toast(
+                                    &workspace,
+                                    format!("Task `{task_label}` failed: {e}"),
+                                    false,
+                                    cx,
+                                );
+                            }
+                            None => log::debug!("Task spawn got cancelled"),
+                        };
+                    }
+                });
+                self.scheduled_tasks.push(task);
+            } else {
+                log::warn!(
+                    "Cannot spawn task `{task_label}` in sidebar: agent panel is unavailable"
+                );
+            }
+        } else if self.terminal_provider.is_some() {
             let task = cx.spawn_in(window, async move |workspace, cx| {
                 Self::save_for_task(&workspace, spawn_in_terminal.save, cx).await;
 
@@ -94,16 +171,35 @@ impl Workspace {
                         Some(Ok(status)) => {
                             if status.success() {
                                 log::debug!("Task spawn succeeded");
+                                if show_completion_toast {
+                                    show_task_toast(
+                                        &workspace,
+                                        format!("Task `{task_label}` succeeded"),
+                                        true,
+                                        cx,
+                                    );
+                                }
                             } else {
                                 log::debug!("Task spawn failed, code: {:?}", status.code());
+                                if show_completion_toast {
+                                    let message = match status.code() {
+                                        Some(code) => format!(
+                                            "Task `{task_label}` failed with exit code {code}"
+                                        ),
+                                        None => format!("Task `{task_label}` failed"),
+                                    };
+                                    show_task_toast(&workspace, message, true, cx);
+                                }
                             }
                         }
                         Some(Err(e)) => {
                             log::error!("Task spawn failed: {e:#}");
-                            _ = workspace.update(cx, |w, cx| {
-                                let id = NotificationId::unique::<ResolvedTask>();
-                                w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
-                            })
+                            show_task_toast(
+                                &workspace,
+                                format!("Task spawn failed: {e}"),
+                                false,
+                                cx,
+                            );
                         }
                         None => log::debug!("Task spawn got cancelled"),
                     };
@@ -360,9 +456,68 @@ mod tests {
         assert!(cx.read(|cx| fixture.item.read(cx).is_dirty));
     }
 
+    #[gpui::test]
+    async fn test_background_task_success_shows_completion_toast(cx: &mut TestAppContext) {
+        let (mut fixture, cx) = create_fixture(cx, SaveStrategy::None).await;
+        fixture.task.resolved.reveal = RevealStrategy::Never;
+
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.schedule_resolved_task(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        assert!(cx.read(|cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .notification_ids()
+                .contains(&NotificationId::unique::<ResolvedTask>())
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_background_task_failure_shows_completion_toast(cx: &mut TestAppContext) {
+        let (mut fixture, cx) =
+            create_fixture_with_status(cx, SaveStrategy::None, exit_status(1)).await;
+        fixture.task.resolved.reveal = RevealStrategy::Never;
+
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.schedule_resolved_task(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        assert!(cx.read(|cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .notification_ids()
+                .contains(&NotificationId::unique::<ResolvedTask>())
+        }));
+    }
+
     async fn create_fixture(
         cx: &mut TestAppContext,
         save_strategy: SaveStrategy,
+    ) -> (Fixture, &mut gpui::VisualTestContext) {
+        create_fixture_with_status(cx, save_strategy, ExitStatus::default()).await
+    }
+
+    async fn create_fixture_with_status(
+        cx: &mut TestAppContext,
+        save_strategy: SaveStrategy,
+        exit_status: ExitStatus,
     ) -> (Fixture, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -393,6 +548,7 @@ mod tests {
         let terminal_provider = Box::new(TestTerminalProvider {
             item: item.clone(),
             dirty_before_spawn: dirty_before_spawn.clone(),
+            exit_status,
         });
         workspace.update(cx, |workspace, _| {
             workspace.terminal_provider = Some(terminal_provider);
@@ -490,6 +646,7 @@ mod tests {
     struct TestTerminalProvider {
         item: Entity<TestItem>,
         dirty_before_spawn: Arc<Mutex<Option<bool>>>,
+        exit_status: ExitStatus,
     }
 
     impl TerminalProvider for TestTerminalProvider {
@@ -500,7 +657,19 @@ mod tests {
             cx: &mut App,
         ) -> Task<Option<Result<ExitStatus>>> {
             *self.dirty_before_spawn.lock() = Some(cx.read_entity(&self.item, |e, _| e.is_dirty));
-            Task::ready(Some(Ok(ExitStatus::default())))
+            Task::ready(Some(Ok(self.exit_status)))
         }
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
     }
 }

@@ -643,6 +643,9 @@ impl TerminalPanel {
                 })
                 .unwrap_or_else(|e| Task::ready(Err(e))),
             RevealTarget::Dock => self.add_terminal_task(spawn_task, reveal, window, cx),
+            RevealTarget::Sidebar => Task::ready(Err(anyhow::anyhow!(
+                "sidebar tasks are spawned by the agent panel"
+            ))),
         }
     }
 
@@ -1057,6 +1060,7 @@ impl TerminalPanel {
                         })
                         .detach();
                     }
+                    RevealTarget::Sidebar => {}
                 },
                 RevealStrategy::NoFocus => match reveal_target {
                     RevealTarget::Center => {
@@ -1084,6 +1088,7 @@ impl TerminalPanel {
                         })
                         .detach();
                     }
+                    RevealTarget::Sidebar => {}
                 },
                 RevealStrategy::Never => {}
             }

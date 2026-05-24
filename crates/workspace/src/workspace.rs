@@ -192,6 +192,15 @@ pub trait TerminalProvider {
     ) -> Task<Option<Result<ExitStatus>>>;
 }
 
+pub trait SidebarTaskProvider {
+    fn spawn(
+        &self,
+        task: SpawnInTerminal,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Option<Result<ExitStatus>>>;
+}
+
 pub trait DebuggerProvider {
     // `active_buffer` is used to resolve build task's name against language-specific tasks.
     fn start_session(
@@ -1396,6 +1405,7 @@ pub struct Workspace {
     on_prompt_for_new_path: Option<PromptForNewPath>,
     on_prompt_for_open_path: Option<PromptForOpenPath>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
+    sidebar_task_provider: Option<Box<dyn SidebarTaskProvider>>,
     debugger_provider: Option<Arc<dyn DebuggerProvider>>,
     serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
     _items_serializer: Task<Result<()>>,
@@ -1842,6 +1852,7 @@ impl Workspace {
             on_prompt_for_new_path: None,
             on_prompt_for_open_path: None,
             terminal_provider: None,
+            sidebar_task_provider: None,
             debugger_provider: None,
             serializable_items_tx,
             _items_serializer,
@@ -2949,6 +2960,10 @@ impl Workspace {
 
     pub fn set_terminal_provider(&mut self, provider: impl TerminalProvider + 'static) {
         self.terminal_provider = Some(Box::new(provider));
+    }
+
+    pub fn set_sidebar_task_provider(&mut self, provider: impl SidebarTaskProvider + 'static) {
+        self.sidebar_task_provider = Some(Box::new(provider));
     }
 
     pub fn set_debugger_provider(&mut self, provider: impl DebuggerProvider + 'static) {

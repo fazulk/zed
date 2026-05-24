@@ -627,6 +627,8 @@ pub enum RevealTarget {
     /// In the terminal dock, "regular" terminal items' place.
     #[default]
     Dock,
+    /// In the threads sidebar, as a new terminal thread in the current workspace.
+    Sidebar,
 }
 
 /// Spawns a task with name or opens tasks modal.
