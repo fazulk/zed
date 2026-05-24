@@ -158,6 +158,26 @@ pub fn init(cx: &mut App) {
                     panel.fetch(false, window, cx);
                 });
             });
+            workspace.register_action(
+                |workspace, _: &git::GenerateCommitMessageAndCommit, window, cx| {
+                    let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                        return;
+                    };
+                    panel.update(cx, |panel, cx| {
+                        panel.generate_commit_message_and_commit(false, window, cx);
+                    });
+                },
+            );
+            workspace.register_action(
+                |workspace, _: &git::GenerateCommitMessageAndCommitAndPush, window, cx| {
+                    let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                        return;
+                    };
+                    panel.update(cx, |panel, cx| {
+                        panel.generate_commit_message_and_commit(true, window, cx);
+                    });
+                },
+            );
             workspace.register_action(|workspace, _: &git::Push, window, cx| {
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
@@ -899,6 +919,12 @@ mod remote_button {
                         .action("Fetch From", git::FetchFrom.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
                         .action("Pull (Rebase)", git::PullRebase.boxed_clone())
+                        .separator()
+                        .action("Commit", git::GenerateCommitMessageAndCommit.boxed_clone())
+                        .action(
+                            "Commit & Push",
+                            git::GenerateCommitMessageAndCommitAndPush.boxed_clone(),
+                        )
                         .separator()
                         .action("Push", git::Push.boxed_clone())
                         .action("Push To", git::PushTo.boxed_clone())

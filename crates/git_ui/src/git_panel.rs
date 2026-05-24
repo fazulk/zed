@@ -2371,6 +2371,16 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.commit_changes_with_post_action(options, false, window, cx);
+    }
+
+    fn commit_changes_with_post_action(
+        &mut self,
+        options: CommitOptions,
+        push_after_commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -2449,6 +2459,10 @@ impl GitPanel {
                             this.commit_editor
                                 .update(cx, |editor, cx| editor.clear(window, cx));
                             this.original_commit_message = None;
+                        }
+
+                        if push_after_commit {
+                            this.push(false, false, window, cx);
                         }
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
@@ -2590,6 +2604,24 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.generate_commit_message(cx);
+    }
+
+    fn generate_commit_message_and_commit_action(
+        &mut self,
+        _: &git::GenerateCommitMessageAndCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generate_commit_message_and_commit(false, window, cx);
+    }
+
+    fn generate_commit_message_and_commit_and_push_action(
+        &mut self,
+        _: &git::GenerateCommitMessageAndCommitAndPush,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generate_commit_message_and_commit(true, window, cx);
     }
 
     fn split_patch(patch: &str) -> Vec<String> {
@@ -2744,6 +2776,28 @@ impl GitPanel {
 
     /// Generates a commit message using an LLM.
     pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        self.generate_commit_message_with_action(None, None, cx);
+    }
+
+    pub fn generate_commit_message_and_commit(
+        &mut self,
+        push_after_commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generate_commit_message_with_action(
+            Some(push_after_commit),
+            Some(window.window_handle()),
+            cx,
+        );
+    }
+
+    fn generate_commit_message_with_action(
+        &mut self,
+        push_after_generate: Option<bool>,
+        window: Option<gpui::AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_commit() || !AgentSettings::get_global(cx).enabled(cx) {
             return;
         }
@@ -2769,6 +2823,29 @@ impl GitPanel {
         });
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
+        let model_selection = {
+            let settings = AgentSettings::get_global(cx);
+            [
+                settings.commit_message_model.as_ref(),
+                settings.default_model.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|selection| {
+                selection.provider.0 == provider.id().0.as_ref()
+                    && selection.model == model.id().0.as_ref()
+            })
+            .cloned()
+        };
+        let thinking_allowed = model_selection
+            .as_ref()
+            .is_some_and(|selection| selection.enable_thinking);
+        let thinking_effort = model_selection
+            .as_ref()
+            .and_then(|selection| selection.effort.clone());
+        let speed = model_selection
+            .as_ref()
+            .and_then(|selection| selection.speed);
         let project = self.project.clone();
         let repo_work_dir = repo.read(cx).work_directory_abs_path.clone();
 
@@ -2847,12 +2924,13 @@ impl GitPanel {
                     tool_choice: None,
                     stop: Vec::new(),
                     temperature,
-                    thinking_allowed: false,
-                    thinking_effort: None,
-                    speed: None,
+                    thinking_allowed,
+                    thinking_effort,
+                    speed,
                 };
 
                 let stream = model.stream_completion_text(request, cx);
+                let mut generated_successfully = true;
                 match stream.await {
                     Ok(mut messages) => {
                         if !text_empty {
@@ -2875,6 +2953,7 @@ impl GitPanel {
                                     })?;
                                 }
                                 Err(e) => {
+                                    generated_successfully = false;
                                     Self::show_commit_message_error(&this, &e, cx);
                                     break;
                                 }
@@ -2882,8 +2961,34 @@ impl GitPanel {
                         }
                     }
                     Err(e) => {
+                        generated_successfully = false;
                         Self::show_commit_message_error(&this, &e, cx);
                     }
+                }
+
+                if generated_successfully
+                    && let (Some(push_after_commit), Some(window)) = (push_after_generate, window)
+                {
+                    window.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            if this.amend_pending {
+                                telemetry::event!("Git Amended", source = "Git Panel");
+                            } else {
+                                telemetry::event!("Git Committed", source = "Git Panel");
+                            }
+                            let options = CommitOptions {
+                                amend: this.amend_pending,
+                                signoff: this.signoff_enabled,
+                                allow_empty: false,
+                            };
+                            this.commit_changes_with_post_action(
+                                options,
+                                push_after_commit,
+                                window,
+                                cx,
+                            );
+                        })
+                    })??;
                 }
 
                 anyhow::Ok(())
@@ -6758,6 +6863,10 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::add_to_gitignore))
                     .on_action(cx.listener(Self::clean_all))
                     .on_action(cx.listener(Self::generate_commit_message_action))
+                    .on_action(cx.listener(Self::generate_commit_message_and_commit_action))
+                    .on_action(
+                        cx.listener(Self::generate_commit_message_and_commit_and_push_action),
+                    )
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_pop))
             })

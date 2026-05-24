@@ -99,6 +99,10 @@ actions!(
         ToggleFillCommitEditor,
         /// Generates a commit message using AI.
         GenerateCommitMessage,
+        /// Generates a commit message using AI, then creates a commit.
+        GenerateCommitMessageAndCommit,
+        /// Generates a commit message using AI, creates a commit, and pushes it.
+        GenerateCommitMessageAndCommitAndPush,
         /// Initializes a new git repository.
         Init,
         /// Opens all modified files in the editor.

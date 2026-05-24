@@ -47,6 +47,14 @@
       },
     },
   },
+  "agent": {
+    "commit_message_model": {
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "enable_thinking": true,
+      "effort": "low",
+    },
+  },
   "file_types": {
     "Dockerfile": ["Dockerfile*[!dockerignore]"],
     "JSONC": ["**/assets/**/*.json", "renovate.json"],
