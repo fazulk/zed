@@ -1895,7 +1895,7 @@ impl GitPanel {
         let mut any_staged_or_partially_staged = false;
 
         for descendant in descendants {
-            if show_placeholders && !descendant.status.is_created() {
+            if show_placeholders {
                 fully_staged_count += 1;
                 any_staged_or_partially_staged = true;
             } else {
@@ -2423,21 +2423,12 @@ impl GitPanel {
             });
             cx.background_spawn(async move { commit_task.await? })
         } else {
-            let changed_files = self
-                .entries
-                .iter()
-                .filter_map(|entry| entry.status_entry())
-                .filter(|status_entry| !status_entry.status.is_created())
-                .map(|status_entry| status_entry.repo_path.clone())
-                .collect::<Vec<_>>();
-
-            if changed_files.is_empty() && !options.amend {
+            if self.entry_count == 0 && !options.amend {
                 error_spawn("No changes to commit", window, cx);
                 return;
             }
 
-            let stage_task =
-                active_repository.update(cx, |repo, cx| repo.stage_entries(changed_files, cx));
+            let stage_task = active_repository.update(cx, |repo, cx| repo.stage_all(cx));
             cx.spawn(async move |_, cx| {
                 stage_task.await?;
                 let commit_task = active_repository.update(cx, |repo, cx| {
@@ -4353,7 +4344,7 @@ impl GitPanel {
     }
 
     pub fn can_commit(&self) -> bool {
-        (self.has_staged_changes() || self.has_tracked_changes()) && !self.has_unstaged_conflicts()
+        (self.has_staged_changes() || self.entry_count > 0) && !self.has_unstaged_conflicts()
     }
 
     pub fn can_stage_all(&self) -> bool {
@@ -4639,7 +4630,7 @@ impl GitPanel {
     pub fn configure_commit_button(&self, cx: &mut Context<Self>) -> (bool, &'static str) {
         if self.has_unstaged_conflicts() {
             (false, "You must resolve conflicts before committing")
-        } else if !self.has_staged_changes() && !self.has_tracked_changes() && !self.amend_pending {
+        } else if !self.has_staged_changes() && self.entry_count == 0 && !self.amend_pending {
             (false, "No changes to commit")
         } else if self.pending_commit.is_some() {
             (false, "Commit in progress")
@@ -4656,15 +4647,15 @@ impl GitPanel {
         if self.amend_pending {
             if self.has_staged_changes() {
                 "Amend"
-            } else if self.has_tracked_changes() {
-                "Amend Tracked"
+            } else if self.entry_count > 0 {
+                "Amend All"
             } else {
                 "Amend"
             }
         } else if self.has_staged_changes() {
             "Commit"
         } else {
-            "Commit Tracked"
+            "Commit All"
         }
     }
 
@@ -4815,6 +4806,7 @@ impl GitPanel {
         let active_repository = self.active_repository.clone()?;
         let git_panel_settings = GitPanelSettings::get_global(cx);
         let show_commit_editor = git_panel_settings.show_commit_editor;
+        let max_title_length = git_panel_settings.commit_title_max_length;
         let settings = ThemeSettings::get_global(cx);
         let panel_editor_style =
             git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
@@ -4842,7 +4834,6 @@ impl GitPanel {
             editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
         });
 
-        let max_title_length = git_panel_settings.commit_title_max_length;
         let title_exceeds_limit = if max_title_length > 0 {
             self.commit_editor
                 .read(cx)
@@ -6279,7 +6270,7 @@ impl GitPanel {
             StageStatus::Unstaged => ToggleState::Unselected,
             StageStatus::PartiallyStaged => ToggleState::Indeterminate,
         };
-        if self.show_placeholders && !self.has_staged_changes() && !entry.status.is_created() {
+        if self.show_placeholders && !self.has_staged_changes() {
             is_staged = ToggleState::Selected;
         }
 

@@ -915,16 +915,16 @@ mod remote_button {
                         .when_some(keybinding_target.clone(), |el, keybinding_target| {
                             el.context(keybinding_target)
                         })
-                        .action("Fetch", git::Fetch.boxed_clone())
-                        .action("Fetch From", git::FetchFrom.boxed_clone())
-                        .action("Pull", git::Pull.boxed_clone())
-                        .action("Pull (Rebase)", git::PullRebase.boxed_clone())
-                        .separator()
                         .action("Commit", git::GenerateCommitMessageAndCommit.boxed_clone())
                         .action(
                             "Commit & Push",
                             git::GenerateCommitMessageAndCommitAndPush.boxed_clone(),
                         )
+                        .separator()
+                        .action("Fetch", git::Fetch.boxed_clone())
+                        .action("Fetch From", git::FetchFrom.boxed_clone())
+                        .action("Pull", git::Pull.boxed_clone())
+                        .action("Pull (Rebase)", git::PullRebase.boxed_clone())
                         .separator()
                         .action("Push", git::Push.boxed_clone())
                         .action("Push To", git::PushTo.boxed_clone())
