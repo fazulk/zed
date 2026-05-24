@@ -711,6 +711,11 @@ pub struct GitPanelSettingsContent {
     /// Default: false
     pub starts_open: Option<bool>,
 
+    /// Whether to show the embedded commit message editor in the Git panel.
+    ///
+    /// Default: true
+    pub show_commit_editor: Option<bool>,
+
     /// Maximum length of the commit message title before a warning is shown.
     /// Set to 0 to disable.
     ///

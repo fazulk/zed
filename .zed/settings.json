@@ -55,6 +55,9 @@
       "effort": "low",
     },
   },
+  "git_panel": {
+    "show_commit_editor": false,
+  },
   "file_types": {
     "Dockerfile": ["Dockerfile*[!dockerignore]"],
     "JSONC": ["**/assets/**/*.json", "renovate.json"],
