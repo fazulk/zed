@@ -100,6 +100,23 @@ const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
+const TERMINAL_AGENT_TASK_ID_PREFIX: &str = "terminal-agent-";
+
+fn agent_id_from_task_id(task_id: &task::TaskId) -> Option<AgentId> {
+    task_id
+        .0
+        .strip_prefix(TERMINAL_AGENT_TASK_ID_PREFIX)
+        .map(AgentId::new)
+}
+
+fn agent_id_from_terminal_view(terminal_view: &Entity<TerminalView>, cx: &App) -> Option<AgentId> {
+    terminal_view
+        .read(cx)
+        .terminal()
+        .read(cx)
+        .task()
+        .and_then(|task| agent_id_from_task_id(&task.spawned_task.id))
+}
 
 /// Maximum number of idle threads kept in the agent panel's retained list.
 /// Set as a GPUI global to override; otherwise defaults to 5.
@@ -143,6 +160,7 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    pub agent_id: Option<AgentId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -762,6 +780,7 @@ struct AgentTerminal {
     title_editor_initial_title: Option<String>,
     title_editor_subscription: Option<Subscription>,
     last_known_title: String,
+    agent_id: Option<AgentId>,
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
     has_notification: bool,
@@ -807,6 +826,9 @@ impl AgentTerminal {
 
     fn refresh_metadata(&mut self, cx: &mut App) -> bool {
         let title_changed = self.refresh_title(cx);
+        if self.agent_id.is_none() {
+            self.agent_id = agent_id_from_terminal_view(&self.view, cx);
+        }
         let current_working_directory = self.view.read(cx).terminal().read(cx).working_directory();
         let working_directory_changed = current_working_directory
             .as_ref()
@@ -1731,11 +1753,8 @@ impl AgentPanel {
             return;
         };
 
-        let display_name = agent_server_store
-            .read(cx)
-            .agent_display_name(&agent_id)
-            .unwrap_or_else(|| agent_id.0.clone());
-        let task_id = task::TaskId(format!("terminal-agent-{}", agent_id.0));
+        let display_name = agent_id.0.clone();
+        let task_id = task::TaskId(format!("{TERMINAL_AGENT_TASK_ID_PREFIX}{}", agent_id.0));
         let workspace_handle = self.workspace.clone();
         let working_directory = self.terminal_working_directory(workspace, cx);
 
@@ -1795,6 +1814,7 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
             true,
             true,
             source,
@@ -1844,6 +1864,7 @@ impl AgentPanel {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
+        let agent_id = agent_id_from_task_id(&task.id);
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = project
@@ -1888,6 +1909,7 @@ impl AgentPanel {
                         Some(custom_title),
                         None,
                         None,
+                        agent_id,
                         select,
                         focus,
                         source,
@@ -1961,6 +1983,7 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        agent_id: Option<AgentId>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2004,6 +2027,7 @@ impl AgentPanel {
                     custom_title,
                     initial_title,
                     created_at,
+                    agent_id,
                     select,
                     focus,
                     source,
@@ -2024,6 +2048,7 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        agent_id: Option<AgentId>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2067,6 +2092,8 @@ impl AgentPanel {
             },
         );
 
+        let resolved_agent_id =
+            agent_id.or_else(|| agent_id_from_terminal_view(&terminal_view, cx));
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2075,6 +2102,7 @@ impl AgentPanel {
             last_known_title: initial_title
                 .map(|title| title.to_string())
                 .unwrap_or_default(),
+            agent_id: resolved_agent_id,
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
@@ -2233,6 +2261,7 @@ impl AgentPanel {
             terminal_id,
             title: terminal.title(cx),
             custom_title: terminal.custom_title(cx),
+            agent_id: terminal.agent_id.clone(),
             created_at: terminal.created_at,
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
@@ -2267,6 +2296,7 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
+            metadata.agent_id.clone(),
             true,
             focus,
             source,
@@ -3193,6 +3223,7 @@ impl AgentPanel {
                 has_notification: terminal.has_notification,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
+                agent_id: terminal.agent_id.clone(),
             })
             .collect()
     }
@@ -4703,6 +4734,7 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
             true,
             false,
             source,
@@ -4723,6 +4755,7 @@ impl AgentPanel {
         if let Err(error) = self.insert_display_only_terminal(
             terminal_id,
             working_directory,
+            None,
             None,
             None,
             None,
@@ -5322,10 +5355,10 @@ impl AgentPanel {
             (None, terminal_title)
         } else if let Agent::Custom { id, .. } = &self.selected_agent {
             let store = agent_server_store.read(cx);
-            let icon = store.agent_icon(&id);
+            let icon = store.agent_icon(&id, cx);
 
             let label = store
-                .agent_display_name(&id)
+                .agent_display_name(&id, cx)
                 .unwrap_or_else(|| self.selected_agent.label());
             (icon, label)
         } else {
@@ -5446,8 +5479,6 @@ impl AgentPanel {
                         })
                         .map(|mut menu| {
                             let agent_server_store = agent_server_store.read(cx);
-                            let registry_store = project::AgentRegistryStore::try_global(cx);
-                            let registry_store_ref = registry_store.as_ref().map(|s| s.read(cx));
 
                             struct AgentMenuItem {
                                 id: AgentId,
@@ -5459,13 +5490,7 @@ impl AgentPanel {
                                 .external_agents()
                                 .map(|agent_id| {
                                     let display_name = agent_server_store
-                                        .agent_display_name(agent_id)
-                                        .or_else(|| {
-                                            registry_store_ref
-                                                .as_ref()
-                                                .and_then(|store| store.agent(agent_id))
-                                                .map(|a| a.name().clone())
-                                        })
+                                        .agent_display_name(agent_id, cx)
                                         .unwrap_or_else(|| agent_id.0.clone());
                                     AgentMenuItem {
                                         id: agent_id.clone(),
@@ -5484,15 +5509,7 @@ impl AgentPanel {
                             for item in &agent_items {
                                 let mut entry = ContextMenuEntry::new(item.display_name.clone());
 
-                                let icon_path =
-                                    agent_server_store.agent_icon(&item.id).or_else(|| {
-                                        registry_store_ref
-                                            .as_ref()
-                                            .and_then(|store| store.agent(&item.id))
-                                            .and_then(|a| a.icon_path().cloned())
-                                    });
-
-                                if let Some(icon_path) = icon_path {
+                                if let Some(icon_path) = agent_server_store.agent_icon(&item.id, cx) {
                                     entry = entry.custom_icon_svg(icon_path);
                                 } else if item.source == ExternalAgentSource::Terminal {
                                     entry = entry.icon(IconName::Terminal);
@@ -6290,6 +6307,7 @@ impl AgentPanel {
             Some(SharedString::from(title.into())),
             None,
             None,
+            None,
             focus,
             focus,
             AgentThreadSource::AgentPanel,
@@ -6326,6 +6344,7 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
+            metadata.agent_id.clone(),
             true,
             focus,
             source,
@@ -6342,6 +6361,7 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        agent_id: Option<AgentId>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -6376,6 +6396,7 @@ impl AgentPanel {
             custom_title,
             initial_title,
             created_at,
+            agent_id,
             select,
             focus,
             source,
@@ -6965,6 +6986,7 @@ mod tests {
             terminal_id: TerminalId::new(),
             title: "Restored Terminal".into(),
             custom_title: None,
+            agent_id: None,
             created_at: Utc::now(),
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",
@@ -8943,6 +8965,7 @@ mod tests {
             terminal_id,
             title: "Persisted Shell Title".into(),
             custom_title: None,
+            agent_id: None,
             created_at: now,
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",
@@ -8994,6 +9017,7 @@ mod tests {
             terminal_id,
             title: "Persisted Shell Title".into(),
             custom_title: None,
+            agent_id: None,
             created_at: now,
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",

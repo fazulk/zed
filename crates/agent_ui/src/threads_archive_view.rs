@@ -619,7 +619,7 @@ impl ThreadsArchiveView {
                 let icon_from_external_svg = self
                     .agent_server_store
                     .upgrade()
-                    .and_then(|store| store.read(cx).agent_icon(&thread.agent_id));
+                    .and_then(|store| store.read(cx).agent_icon(&thread.agent_id, cx));
 
                 let icon = if thread.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
                     IconName::ZedAgent

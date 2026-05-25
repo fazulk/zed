@@ -101,7 +101,7 @@ pub struct ThreadImportModal {
 impl ThreadImportModal {
     pub fn new(
         agent_server_store: Entity<AgentServerStore>,
-        agent_registry_store: Entity<AgentRegistryStore>,
+        _agent_registry_store: Entity<AgentRegistryStore>,
         workspace: WeakEntity<Workspace>,
         multi_workspace: WeakEntity<MultiWorkspace>,
         _window: &mut Window,
@@ -115,23 +115,11 @@ impl ThreadImportModal {
             .map(|agent_id| {
                 let display_name = agent_server_store
                     .read(cx)
-                    .agent_display_name(agent_id)
-                    .or_else(|| {
-                        agent_registry_store
-                            .read(cx)
-                            .agent(agent_id)
-                            .map(|agent| agent.name().clone())
-                    })
+                    .agent_display_name(agent_id, cx)
                     .unwrap_or_else(|| agent_id.0.clone());
                 let icon_path = agent_server_store
                     .read(cx)
-                    .agent_icon(agent_id)
-                    .or_else(|| {
-                        agent_registry_store
-                            .read(cx)
-                            .agent(agent_id)
-                            .and_then(|agent| agent.icon_path().cloned())
-                    });
+                    .agent_icon(agent_id, cx);
 
                 AgentEntry {
                     agent_id: agent_id.clone(),

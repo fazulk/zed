@@ -271,6 +271,8 @@ struct ThreadEntry {
 #[derive(Clone)]
 struct TerminalEntry {
     metadata: TerminalThreadMetadata,
+    icon: IconName,
+    icon_from_external_svg: Option<SharedString>,
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
@@ -1263,21 +1265,32 @@ impl Sidebar {
             };
             let icon_from_external_svg = agent_server_store
                 .as_ref()
-                .and_then(|store| store.read(cx).agent_icon(&agent_id));
+                .and_then(|store| store.read(cx).agent_icon(&agent_id, cx));
             (icon, icon_from_external_svg)
+        };
+
+        let resolve_terminal_icon = |agent_id: Option<&AgentId>| -> (IconName, Option<SharedString>) {
+            let icon_from_external_svg = agent_id.and_then(|agent_id| {
+                agent_server_store
+                    .as_ref()
+                    .and_then(|store| store.read(cx).agent_icon(agent_id, cx))
+            });
+            (IconName::Terminal, icon_from_external_svg)
         };
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_agent_ids: HashMap<TerminalId, AgentId> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                    if let Some(agent_id) = terminal.agent_id {
+                        live_terminal_agent_ids.insert(terminal.id, agent_id);
+                    }
+                }
             }
         }
 
@@ -1337,12 +1350,19 @@ impl Sidebar {
                 linked_worktree_path_lists_for_workspaces(group_workspaces, cx);
             let make_terminal_entry =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
+                    let agent_id = metadata
+                        .agent_id
+                        .as_ref()
+                        .or_else(|| live_terminal_agent_ids.get(&metadata.terminal_id));
+                    let (icon, icon_from_external_svg) = resolve_terminal_icon(agent_id);
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
                     TerminalEntry {
                         metadata,
+                        icon,
+                        icon_from_external_svg,
                         workspace,
                         worktrees,
                         has_notification,
@@ -5154,6 +5174,8 @@ impl Sidebar {
                         format_history_entry_timestamp(terminal.metadata.created_at).into();
                     Some(ThreadSwitcherEntry::Terminal(ThreadSwitcherTerminalEntry {
                         metadata: terminal.metadata.clone(),
+                        icon: terminal.icon,
+                        icon_from_external_svg: terminal.icon_from_external_svg.clone(),
                         workspace: terminal.workspace.clone(),
                         project_name: current_header_label.clone(),
                         worktrees: terminal
@@ -5618,7 +5640,10 @@ impl Sidebar {
 
         ThreadItem::new(id, terminal.metadata.title.clone())
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(terminal.icon)
+            .when_some(terminal.icon_from_external_svg.clone(), |this, svg| {
+                this.custom_icon_from_external_svg(svg)
+            })
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)

@@ -1746,6 +1746,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         terminal_id,
         title: "Dev Server".into(),
         custom_title: None,
+        agent_id: None,
         created_at: now,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project-a")]),
@@ -2916,6 +2917,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
+        agent_id: None,
         created_at,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),
@@ -3023,6 +3025,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
+        agent_id: None,
         created_at,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),
@@ -3164,6 +3167,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
+        agent_id: None,
         created_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),

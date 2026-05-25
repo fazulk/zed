@@ -203,6 +203,49 @@ static EXTENSION_TO_REGISTRY_IDS: LazyLock<HashMap<&'static str, &'static str>> 
         ])
     });
 
+/// Maps terminal-agent settings keys to ACP registry agent IDs so terminal
+/// agents can reuse registry icons and display names.
+static TERMINAL_AGENT_REGISTRY_ALIASES: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        HashMap::from_iter([
+            ("claude", "claude-acp"),
+            ("codex", "codex-acp"),
+            ("droid", "factory-droid"),
+            ("pi", "pi-acp"),
+        ])
+    });
+
+fn registry_agent_for_settings_key<'a>(
+    agents: &'a [RegistryAgent],
+    settings_key: &str,
+) -> Option<&'a RegistryAgent> {
+    agents
+        .iter()
+        .find(|agent| agent.id().0.as_ref() == settings_key)
+        .or_else(|| {
+            TERMINAL_AGENT_REGISTRY_ALIASES
+                .get(settings_key)
+                .and_then(|registry_id| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.id().0.as_ref() == *registry_id)
+                })
+        })
+}
+
+fn registry_agent_for_settings_key_in_map<'a>(
+    agents: &'a HashMap<String, RegistryAgent>,
+    settings_key: &str,
+) -> Option<&'a RegistryAgent> {
+    agents
+        .get(settings_key)
+        .or_else(|| {
+            TERMINAL_AGENT_REGISTRY_ALIASES
+                .get(settings_key)
+                .and_then(|registry_id| agents.get(*registry_id))
+        })
+}
+
 impl AgentServerStore {
     pub fn migrate_agent_server_from_extensions(
         &mut self,
@@ -237,10 +280,19 @@ impl AgentServerStore {
         });
     }
 
-    pub fn agent_icon(&self, id: &AgentId) -> Option<SharedString> {
-        self.external_agents
+    pub fn agent_icon(&self, id: &AgentId, cx: &gpui::App) -> Option<SharedString> {
+        if let Some(icon) = self
+            .external_agents
             .get(id)
             .and_then(|entry| entry.icon.clone())
+        {
+            return Some(icon);
+        }
+
+        AgentRegistryStore::try_global(cx).and_then(|store| {
+            registry_agent_for_settings_key(store.read(cx).agents(), id.0.as_ref())
+                .and_then(|agent| agent.icon_path().cloned())
+        })
     }
 
     pub fn agent_source(&self, name: &AgentId) -> Option<ExternalAgentSource> {
@@ -249,10 +301,20 @@ impl AgentServerStore {
 }
 
 impl AgentServerStore {
-    pub fn agent_display_name(&self, name: &AgentId) -> Option<SharedString> {
-        self.external_agents
-            .get(name)
-            .and_then(|entry| entry.display_name.clone())
+    pub fn agent_display_name(&self, name: &AgentId, cx: &gpui::App) -> Option<SharedString> {
+        if let Some(entry) = self.external_agents.get(name) {
+            if entry.source == ExternalAgentSource::Terminal {
+                return Some(name.0.clone());
+            }
+            if let Some(display_name) = entry.display_name.clone() {
+                return Some(display_name);
+            }
+        }
+
+        AgentRegistryStore::try_global(cx).and_then(|store| {
+            registry_agent_for_settings_key(store.read(cx).agents(), name.0.as_ref())
+                .map(|agent| agent.name().clone())
+        })
     }
 
     pub fn init_remote(session: &AnyProtoClient) {
@@ -350,6 +412,19 @@ impl AgentServerStore {
                 CustomAgentServerSettings::Custom { command, .. }
                 | CustomAgentServerSettings::Terminal { command } => {
                     let agent_name = AgentId(name.clone().into());
+                    let registry_agent =
+                        registry_agent_for_settings_key_in_map(&registry_agents_by_id, name);
+                    let icon = registry_agent
+                        .and_then(|agent| agent.metadata().icon_path.clone());
+                    let display_name = match settings {
+                        CustomAgentServerSettings::Terminal { .. } => None,
+                        CustomAgentServerSettings::Custom { .. } => {
+                            registry_agent.map(|agent| agent.name().clone())
+                        }
+                        CustomAgentServerSettings::Registry { .. } => {
+                            unreachable!("registry settings handled separately")
+                        }
+                    };
                     self.external_agents.insert(
                         agent_name.clone(),
                         ExternalAgentEntry::new(
@@ -368,8 +443,8 @@ impl AgentServerStore {
                                     unreachable!("registry settings handled separately")
                                 }
                             },
-                            None,
-                            None,
+                            icon,
+                            display_name,
                         ),
                     );
                 }
@@ -1731,6 +1806,43 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_agent_uses_registry_icon_for_alias(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        let icon_path = SharedString::from("pi-acp.svg");
+        init_registry(
+            cx,
+            vec![RegistryAgent::Npx(RegistryNpxAgent {
+                metadata: RegistryAgentMetadata {
+                    id: AgentId::new("pi-acp"),
+                    name: SharedString::from("pi ACP"),
+                    description: SharedString::from(""),
+                    version: SharedString::from("0.0.1"),
+                    repository: None,
+                    website: None,
+                    icon_path: Some(icon_path.clone()),
+                },
+                package: SharedString::from("pi-acp"),
+                args: Vec::new(),
+                env: HashMap::default(),
+            })],
+        );
+        set_terminal_agent_settings(cx, "pi");
+        let store = create_agent_server_store(cx);
+
+        cx.update(|cx| {
+            let store = store.read(cx);
+            assert_eq!(
+                store.agent_icon(&AgentId::from("pi"), cx),
+                Some(icon_path.clone())
+            );
+            assert_eq!(
+                store.agent_display_name(&AgentId::from("pi"), cx),
+                Some(SharedString::from("pi"))
+            );
+        });
     }
 
     #[test]

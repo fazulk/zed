@@ -1039,13 +1039,13 @@ impl AgentConfiguration {
         let agents: Vec<_> = agents
             .into_iter()
             .map(|name| {
-                let icon = if let Some(icon_path) = agent_server_store.agent_icon(&name) {
+                let icon = if let Some(icon_path) = agent_server_store.agent_icon(&name, cx) {
                     AgentIcon::Path(icon_path)
                 } else {
                     AgentIcon::Name(IconName::Sparkle)
                 };
                 let display_name = agent_server_store
-                    .agent_display_name(&name)
+                    .agent_display_name(&name, cx)
                     .unwrap_or_else(|| name.0.clone());
                 let source = agent_server_store.agent_source(&name).unwrap_or_default();
                 (name, icon, display_name, source)

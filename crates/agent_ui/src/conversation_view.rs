@@ -1207,22 +1207,14 @@ impl ConversationView {
         let agent_display_name = self
             .agent_server_store
             .read(cx)
-            .agent_display_name(&agent_id.clone())
+            .agent_display_name(&agent_id.clone(), cx)
             .unwrap_or_else(|| agent_id.0.clone());
 
         let agent_icon = self.agent.logo();
         let agent_icon_from_external_svg = self
             .agent_server_store
             .read(cx)
-            .agent_icon(&self.agent.agent_id())
-            .or_else(|| {
-                project::AgentRegistryStore::try_global(cx).and_then(|store| {
-                    store
-                        .read(cx)
-                        .agent(&self.agent.agent_id())
-                        .and_then(|a| a.icon_path().cloned())
-                })
-            });
+            .agent_icon(&self.agent.agent_id(), cx);
 
         let weak = cx.weak_entity();
         cx.new(|cx| {
@@ -1710,7 +1702,7 @@ impl ConversationView {
                     let agent_display_name = self
                         .agent_server_store
                         .read(cx)
-                        .agent_display_name(&self.agent.agent_id())
+                        .agent_display_name(&self.agent.agent_id(), cx)
                         .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
 
                     let new_placeholder =
@@ -2123,7 +2115,7 @@ impl ConversationView {
         let agent_display_name = self
             .agent_server_store
             .read(cx)
-            .agent_display_name(&self.agent.agent_id())
+            .agent_display_name(&self.agent.agent_id(), cx)
             .unwrap_or_else(|| self.agent.agent_id().0);
 
         let show_fallback_description = auth_methods.len() > 1
