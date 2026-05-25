@@ -108,6 +108,7 @@ pub enum MultiWorkspaceEvent {
     WorkspaceAdded(Entity<Workspace>),
     WorkspaceRemoved(EntityId),
     ProjectGroupsChanged,
+    SidebarOpened,
 }
 
 pub enum SidebarEvent {
@@ -475,6 +476,7 @@ impl MultiWorkspace {
     }
 
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
+        let was_closed = !self.sidebar_open;
         self.sidebar_open = true;
         self.retain_active_workspace(cx);
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
@@ -482,6 +484,9 @@ impl MultiWorkspace {
             workspace.update(cx, |workspace, _cx| {
                 workspace.set_sidebar_focus_handle(sidebar_focus_handle.clone());
             });
+        }
+        if was_closed {
+            cx.emit(MultiWorkspaceEvent::SidebarOpened);
         }
         self.serialize(cx);
         cx.notify();

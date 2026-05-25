@@ -1227,6 +1227,10 @@ impl AgentPanel {
                 panel
             })?;
 
+            panel.update(cx, |panel, cx| {
+                panel.warm_up_sidebar_launch(cx);
+            });
+
             Ok(panel)
         })
     }
@@ -1285,7 +1289,7 @@ impl AgentPanel {
                 | project::Event::WorktreeRemoved(_)
                 | project::Event::WorktreeOrderChanged
                 | project::Event::WorktreePathsChanged { .. } => {
-                    this.ensure_native_agent_connection(cx);
+                    this.warm_up_sidebar_launch(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
                     cx.notify();
@@ -1349,8 +1353,14 @@ impl AgentPanel {
             is_active: false,
         };
 
-        panel.ensure_native_agent_connection(cx);
         panel
+    }
+
+    /// Preconnects agent backends and resolves the default terminal environment
+    /// so sidebar thread and terminal creation feels faster.
+    pub fn warm_up_sidebar_launch(&self, cx: &mut Context<Self>) {
+        self.ensure_agent_connections(cx);
+        self.warm_up_terminal_environment(cx);
     }
 
     pub fn toggle_focus(
@@ -1681,6 +1691,7 @@ impl AgentPanel {
         }
 
         self.selected_agent = action.agent.clone().into();
+        self.warm_up_sidebar_launch(cx);
         if self
             .project
             .read(cx)
@@ -2736,7 +2747,7 @@ impl AgentPanel {
         self.project.read(cx).visible_worktrees(cx).next().is_some()
     }
 
-    fn ensure_native_agent_connection(&self, cx: &mut Context<Self>) {
+    fn ensure_agent_connections(&self, cx: &mut Context<Self>) {
         if !self.has_open_project(cx) {
             return;
         }
@@ -2746,9 +2757,64 @@ impl AgentPanel {
         self.connection_store.update(cx, |store, cx| {
             store.request_connection(
                 Agent::NativeAgent,
-                Agent::NativeAgent.server(fs, thread_store),
+                Agent::NativeAgent.server(fs.clone(), thread_store.clone()),
                 cx,
             );
+        });
+
+        if self.project.read(cx).is_via_collab() {
+            return;
+        }
+
+        let selected_agent = self.selected_agent.clone();
+        if matches!(selected_agent, Agent::NativeAgent) {
+            return;
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(selected_agent, Agent::Stub) {
+            self.connection_store.update(cx, |store, cx| {
+                store.request_connection(
+                    Agent::Stub,
+                    Agent::Stub.server(self.fs.clone(), self.thread_store.clone()),
+                    cx,
+                );
+            });
+            return;
+        }
+
+        let Agent::Custom { id } = selected_agent else {
+            return;
+        };
+
+        let agent_server_store = self.project.read(cx).agent_server_store();
+        if agent_server_store.read(cx).agent_source(&id) == Some(ExternalAgentSource::Terminal) {
+            return;
+        }
+
+        self.connection_store.update(cx, |store, cx| {
+            store.request_connection(
+                Agent::Custom { id: id.clone() },
+                Agent::Custom { id }.server(self.fs.clone(), self.thread_store.clone()),
+                cx,
+            );
+        });
+    }
+
+    fn warm_up_terminal_environment(&self, cx: &mut Context<Self>) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            let working_directory = workspace
+                .upgrade()
+                .and_then(|workspace| terminal_view::default_working_directory(workspace.read(cx), cx));
+            project.update(cx, |project, cx| {
+                project.warm_up_terminal_environment(working_directory, cx);
+            });
         });
     }
 
@@ -3296,7 +3362,7 @@ impl AgentPanel {
                     return;
                 }
 
-                this.ensure_native_agent_connection(cx);
+                this.ensure_agent_connections(cx);
                 let Some(connect_task) = this.connection_store.update(cx, |store, cx| {
                     store
                         .entry(&Agent::NativeAgent)

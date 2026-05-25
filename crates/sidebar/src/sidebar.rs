@@ -695,7 +695,7 @@ impl Sidebar {
         cx.subscribe_in(
             &multi_workspace,
             window,
-            |this, _multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
+            |this, multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
@@ -704,6 +704,12 @@ impl Sidebar {
                 MultiWorkspaceEvent::WorkspaceAdded(workspace) => {
                     this.subscribe_to_workspace(workspace, window, cx);
                     this.update_entries(cx);
+                    if multi_workspace.read(cx).sidebar_open() {
+                        this.warm_up_agent_panel(workspace, cx);
+                    }
+                }
+                MultiWorkspaceEvent::SidebarOpened => {
+                    this.warm_up_agent_panels(cx);
                 }
                 MultiWorkspaceEvent::WorkspaceRemoved(_)
                 | MultiWorkspaceEvent::ProjectGroupsChanged => {
@@ -809,6 +815,24 @@ impl Sidebar {
         self.multi_workspace
             .upgrade()
             .map_or(false, |mw| mw.read(cx).workspace() == workspace)
+    }
+
+    fn warm_up_agent_panels(&self, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        for workspace in &workspaces {
+            self.warm_up_agent_panel(workspace, cx);
+        }
+    }
+
+    fn warm_up_agent_panel(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.warm_up_sidebar_launch(cx);
+            });
+        }
     }
 
     fn subscribe_to_workspace(

@@ -291,6 +291,47 @@ impl Project {
         self.create_terminal_shell_internal(cwd, false, cx)
     }
 
+    /// Starts resolving the shell environment for a terminal working directory
+    /// so subsequent terminal spawns can reuse the cached result.
+    pub fn warm_up_terminal_environment(
+        &mut self,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = cwd else {
+            return;
+        };
+        let path = Arc::from(&*cwd);
+
+        let mut settings_location = None;
+        if let Some((worktree, _)) = self.find_worktree(&path, cx) {
+            settings_location = Some(SettingsLocation {
+                worktree_id: worktree.read(cx).id(),
+                path: RelPath::empty(),
+            });
+        }
+        let settings = TerminalSettings::get(settings_location, cx);
+        let remote_client = self.remote_client.clone();
+        let shell = match &remote_client {
+            Some(remote_client) => remote_client
+                .read(cx)
+                .shell()
+                .unwrap_or_else(get_default_system_shell),
+            None => settings.shell.program(),
+        };
+        let env_shell = match &remote_client {
+            Some(_) => shell.clone(),
+            None => get_system_shell(),
+        };
+
+        let env_task =
+            self.resolve_directory_environment(&env_shell, Some(path), remote_client, cx);
+        cx.background_spawn(async move {
+            env_task.await;
+        })
+        .detach();
+    }
+
     /// Creates a local terminal even if the project is remote.
     /// In remote projects: opens in Zed's launch directory (bypasses SSH).
     /// In local projects: opens in the project directory (same as regular terminals).
