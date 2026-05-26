@@ -2699,7 +2699,7 @@ pub(super) fn render_diff_hunk_controls(
                     })
             })
         })
-        .when(show_stage_restore, |el| {
+        .when(show_stage_restore && status.has_secondary_hunk(), |el| {
             el.child(
                 Button::new(("restore", row as u64), "Restore")
                     .tooltip({
