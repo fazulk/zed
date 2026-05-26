@@ -286,7 +286,7 @@ impl Editor {
     }
 
     pub fn git_restore(&mut self, _: &Restore, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.read_only(cx) && !self.delegate_stage_and_restore {
             return;
         }
         let selections = self
@@ -701,7 +701,7 @@ impl Editor {
         );
     }
 
-    pub(super) fn restore_diff_hunks(&self, hunks: Vec<MultiBufferDiffHunk>, cx: &mut App) {
+    pub fn restore_diff_hunks(&self, hunks: Vec<MultiBufferDiffHunk>, cx: &mut App) {
         let mut revert_changes = HashMap::default();
         let chunk_by = hunks.into_iter().chunk_by(|hunk| hunk.buffer_id);
         for (buffer_id, hunks) in &chunk_by {
@@ -1390,7 +1390,7 @@ impl Editor {
         self.do_stage_or_unstage_and_next(false, window, cx);
     }
 
-    pub(super) fn do_stage_or_unstage(
+    pub fn do_stage_or_unstage(
         &self,
         stage: bool,
         buffer_id: BufferId,
@@ -1398,7 +1398,10 @@ impl Editor {
         cx: &mut App,
     ) -> Option<()> {
         let project = self.project()?;
-        let buffer = project.read(cx).buffer_for_id(buffer_id, cx)?;
+        let buffer = project
+            .read(cx)
+            .buffer_for_id(buffer_id, cx)
+            .or_else(|| self.buffer.read(cx).buffer(buffer_id))?;
         let diff = self.buffer.read(cx).diff_for(buffer_id)?;
         let buffer_snapshot = buffer.read(cx).snapshot();
         let file_exists = buffer_snapshot

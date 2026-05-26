@@ -25,6 +25,7 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
     FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
 };
+use itertools::Itertools;
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
@@ -735,6 +736,25 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) {
         match event {
+            EditorEvent::StageOrUnstageRequested { stage, hunks } => {
+                let stage = *stage;
+                self.editor.update(cx, |editor, cx| {
+                    let rhs_editor = editor.rhs_editor();
+                    rhs_editor.update(cx, |editor, cx| {
+                        let chunk_by = hunks.iter().cloned().chunk_by(|hunk| hunk.buffer_id);
+                        for (buffer_id, hunks) in &chunk_by {
+                            editor.do_stage_or_unstage(stage, buffer_id, hunks, cx);
+                        }
+                    });
+                });
+            }
+            EditorEvent::RestoreRequested { hunks } => {
+                self.editor.update(cx, |editor, cx| {
+                    editor.rhs_editor().update(cx, |editor, cx| {
+                        editor.restore_diff_hunks(hunks.clone(), cx)
+                    });
+                });
+            }
             EditorEvent::SelectionsChanged { local: true } => {
                 let Some(project_path) = self.active_path(cx) else {
                     return;
@@ -942,9 +962,10 @@ impl ProjectDiff {
                 cx.update(|window, cx| {
                     this.update(cx, |this, cx| {
                         let multibuffer = this.multibuffer.read(cx);
-                        let skip = multibuffer.buffer(buffer.read(cx).remote_id()).is_some()
+                        let buffer_id = buffer.read(cx).remote_id();
+                        let skip = multibuffer.buffer(buffer_id).is_some()
                             && multibuffer
-                                .diff_for(buffer.read(cx).remote_id())
+                                .diff_for(buffer_id)
                                 .is_some_and(|prev_diff| prev_diff.entity_id() == diff.entity_id())
                             && match reason {
                                 RefreshReason::DiffChanged | RefreshReason::EditorSaved => {
@@ -3007,7 +3028,7 @@ mod tests {
             let branch_diff = cx.new(|cx| {
                 branch_diff::BranchDiff::new(DiffBase::Staged, project.clone(), window, cx)
             });
-            ProjectDiff::new_impl(branch_diff, project.clone(), workspace, window, cx)
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
         });
         cx.run_until_parked();
 
@@ -3021,6 +3042,69 @@ mod tests {
             "
             .unindent(),
         );
+    }
+
+    #[gpui::test]
+    async fn test_staged_diff_can_unstage_inline_hunk(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "staged content\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "original\n".into())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "staged content\n".into())],
+        );
+        cx.run_until_parked();
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let diff = cx.new_window_entity(|window, cx| {
+            let branch_diff = cx.new(|cx| {
+                branch_diff::BranchDiff::new(DiffBase::Staged, project.clone(), window, cx)
+            });
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        let hunk_statuses = cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                editor
+                    .diff_hunks_in_ranges(
+                        &[editor::Anchor::Min..editor::Anchor::Max],
+                        &snapshot.buffer_snapshot(),
+                    )
+                    .map(|hunk| hunk.status().secondary)
+                    .collect::<Vec<_>>()
+            })
+        });
+        assert_eq!(hunk_statuses, &[DiffHunkSecondaryStatus::NoSecondaryHunk]);
+        cx.focus(&diff);
+        cx.dispatch_action(UnstageAndNext);
+        cx.run_until_parked();
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "original\n".into())],
+        );
+        cx.run_until_parked();
+
+        assert_state_with_diff(&editor, cx, &"ˇ".unindent());
     }
 
     #[gpui::test]
@@ -3056,7 +3140,7 @@ mod tests {
             let branch_diff = cx.new(|cx| {
                 branch_diff::BranchDiff::new(DiffBase::Unstaged, project.clone(), window, cx)
             });
-            ProjectDiff::new_impl(branch_diff, project.clone(), workspace, window, cx)
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
         });
         cx.run_until_parked();
 
@@ -3070,6 +3154,119 @@ mod tests {
             "
             .unindent(),
         );
+    }
+
+    #[gpui::test]
+    async fn test_unstaged_staging_diff_can_stage_inline_hunk(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "worktree content\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "original\n".into())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "staged content\n".into())],
+        );
+        cx.run_until_parked();
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let diff = cx.new_window_entity(|window, cx| {
+            let branch_diff = cx.new(|cx| {
+                branch_diff::BranchDiff::new(DiffBase::Unstaged, project.clone(), window, cx)
+            });
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        cx.focus(&diff);
+        cx.dispatch_action(StageAndNext);
+        cx.run_until_parked();
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "worktree content\n".into())],
+        );
+        cx.run_until_parked();
+
+        assert_state_with_diff(&editor, cx, &"ˇ".unindent());
+    }
+
+    #[gpui::test]
+    async fn test_staged_diff_auto_refreshes_when_index_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "new staged content\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "original\n".into())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "old staged content\n".into())],
+        );
+        cx.run_until_parked();
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let diff = cx.new_window_entity(|window, cx| {
+            let branch_diff = cx.new(|cx| {
+                branch_diff::BranchDiff::new(DiffBase::Staged, project.clone(), window, cx)
+            });
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        assert_state_with_diff(
+            &editor,
+            cx,
+            &"
+                - ˇoriginal
+                + old staged content
+            "
+            .unindent(),
+        );
+
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "new staged content\n".into())],
+        );
+        cx.run_until_parked();
+
+        let refreshed_text = cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.snapshot(window, cx).buffer_snapshot().text()
+            })
+        });
+        assert!(refreshed_text.contains("new staged content"));
+        assert!(!refreshed_text.contains("old staged content"));
     }
 
     #[gpui::test]
@@ -3113,7 +3310,7 @@ mod tests {
             let branch_diff = cx.new(|cx| {
                 branch_diff::BranchDiff::new(DiffBase::Staged, project.clone(), window, cx)
             });
-            ProjectDiff::new_impl(branch_diff, project.clone(), workspace, window, cx)
+            ProjectDiff::new_impl(branch_diff, project.clone(), workspace.clone(), window, cx)
         });
         cx.run_until_parked();
 

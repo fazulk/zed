@@ -18,7 +18,7 @@ use language::{Buffer, HighlightedText};
 use multi_buffer::MultiBuffer;
 use project::{
     Project,
-    git_store::{Repository, RepositoryId},
+    git_store::{Repository, RepositoryId, branch_diff::DiffBase},
 };
 use settings::{DiffViewStyle, Settings, SettingsStore, update_settings_file};
 use std::{
@@ -42,6 +42,7 @@ pub struct SoloDiffView {
     repository: Entity<Repository>,
     repository_id: RepositoryId,
     repo_path: RepoPath,
+    diff_base: DiffBase,
     buffer: Entity<Buffer>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
@@ -53,6 +54,7 @@ impl SoloDiffView {
         entry: GitStatusEntry,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
+        diff_base: DiffBase,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -60,19 +62,48 @@ impl SoloDiffView {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
 
-        let existing = {
+        let existing_items = {
             workspace_entity
                 .read(cx)
-                .items_of_type::<SoloDiffView>(cx)
-                .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx))
+                .panes()
+                .iter()
+                .flat_map(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .enumerate()
+                        .filter_map(|(index, item)| {
+                            let solo_diff = item.downcast::<SoloDiffView>()?;
+                            solo_diff
+                                .read(cx)
+                                .matches_path(&repository, &entry.repo_path, cx)
+                                .then_some((pane.clone(), index, solo_diff))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
         };
+        let existing = existing_items.iter().find_map(|(_, _, item)| {
+            item.read(cx)
+                .matches(&repository, &entry.repo_path, &diff_base, cx)
+                .then_some(item.clone())
+        });
         if let Some(existing) = existing {
+            for (pane, _, item) in existing_items {
+                if item.entity_id() != existing.entity_id() {
+                    pane.update(cx, |pane, cx| {
+                        pane.remove_item(item.item_id(), false, false, window, cx);
+                    });
+                }
+            }
             workspace_entity.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
             });
             existing.focus_handle(cx).focus(window, cx);
             return Task::ready(Ok(existing));
         }
+        let replacement_target = existing_items
+            .first()
+            .map(|(pane, index, _)| (pane.clone(), *index));
 
         let Some(project_path) = repository
             .read(cx)
@@ -85,18 +116,46 @@ impl SoloDiffView {
         };
 
         let project = workspace_entity.read(cx).project().clone();
-        let repo_path = entry.repo_path.clone();
+        let repo_path = entry.repo_path;
         window.spawn(cx, async move |cx| {
             let buffer = project
                 .update(cx, |project, cx| {
                     project.open_buffer(project_path.clone(), cx)
                 })
                 .await?;
-            let diff = project
-                .update(cx, |project, cx| {
-                    project.open_uncommitted_diff(buffer.clone(), cx)
-                })
-                .await?;
+            let (buffer, diff) = match diff_base {
+                DiffBase::Head => {
+                    let diff = project
+                        .update(cx, |project, cx| {
+                            project.open_uncommitted_diff(buffer.clone(), cx)
+                        })
+                        .await?;
+                    (buffer, diff)
+                }
+                DiffBase::Staged => {
+                    let (buffer, diff) = project
+                        .update(cx, |project, cx| {
+                            project.git_store().update(cx, |git_store, cx| {
+                                git_store.open_staged_diff(buffer.clone(), cx)
+                            })
+                        })
+                        .await?;
+                    (buffer, diff)
+                }
+                DiffBase::Unstaged => {
+                    let diff = project
+                        .update(cx, |project, cx| {
+                            project.git_store().update(cx, |git_store, cx| {
+                                git_store.open_unstaged_staging_diff(buffer.clone(), cx)
+                            })
+                        })
+                        .await?;
+                    (buffer, diff)
+                }
+                DiffBase::Merge { .. } => {
+                    anyhow::bail!("solo diff cannot be opened with a merge base");
+                }
+            };
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
                 let workspace_handle = cx.entity();
@@ -105,6 +164,7 @@ impl SoloDiffView {
                         project,
                         repository,
                         repo_path,
+                        diff_base,
                         buffer,
                         diff,
                         workspace_handle,
@@ -113,7 +173,30 @@ impl SoloDiffView {
                     )
                 });
 
-                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                if let Some((pane, index)) = replacement_target {
+                    for (pane, _, item) in existing_items {
+                        pane.update(cx, |pane, cx| {
+                            pane.remove_item(item.item_id(), false, false, window, cx);
+                        });
+                    }
+                    workspace.add_item(
+                        pane,
+                        Box::new(view.clone()),
+                        Some(index),
+                        false,
+                        true,
+                        window,
+                        cx,
+                    );
+                } else {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                }
                 view
             })
         })
@@ -123,6 +206,7 @@ impl SoloDiffView {
         project: Entity<Project>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        diff_base: DiffBase,
         buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         workspace: Entity<Workspace>,
@@ -179,6 +263,7 @@ impl SoloDiffView {
             repository,
             repository_id,
             repo_path,
+            diff_base,
             buffer,
             editor,
             workspace: workspace.downgrade(),
@@ -186,7 +271,23 @@ impl SoloDiffView {
         }
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
+    fn matches(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        diff_base: &DiffBase,
+        cx: &App,
+    ) -> bool {
+        self.matches_path(repository, repo_path, cx)
+            && std::mem::discriminant(&self.diff_base) == std::mem::discriminant(diff_base)
+    }
+
+    fn matches_path(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        cx: &App,
+    ) -> bool {
         self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
     }
 
@@ -254,7 +355,11 @@ impl SoloDiffView {
     }
 
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
-        self.focus_handle(cx).focus(window, cx);
+        self.editor
+            .read(cx)
+            .rhs_editor()
+            .focus_handle(cx)
+            .focus(window, cx);
         let action = action.boxed_clone();
         cx.defer(move |cx| {
             cx.dispatch_action(action.as_ref());
@@ -284,6 +389,11 @@ impl SoloDiffView {
                 })
         });
         task.detach_and_notify_err(workspace, window, cx);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn editor(&self) -> &Entity<SplittableEditor> {
+        &self.editor
     }
 }
 

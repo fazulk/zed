@@ -441,7 +441,7 @@ impl BranchDiff {
                 let diff = project
                     .update(cx, |project, cx| {
                         project.git_store().update(cx, |git_store, cx| {
-                            git_store.open_unstaged_diff(buffer.clone(), cx)
+                            git_store.open_unstaged_staging_diff(buffer.clone(), cx)
                         })
                     })?
                     .await?;

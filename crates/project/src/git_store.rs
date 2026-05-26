@@ -861,25 +861,18 @@ impl GitStore {
         };
 
         let committed_text = repo.update(cx, |repo, cx| {
-            repo.load_committed_text(buffer_id, repo_path.clone(), cx)
+            repo.load_head_text(buffer_id, repo_path.clone(), cx)
         });
         let staged_text = repo.update(cx, |repo, cx| {
-            repo.load_staged_text(buffer_id, repo_path, cx)
+            repo.load_staged_text(buffer_id, repo_path.clone(), cx)
         });
 
         let file = buffer.read(cx).file().cloned();
         let language = buffer.read(cx).language().cloned();
 
-        cx.spawn(async move |_this, cx| {
-            let diff_bases_change = committed_text.await?;
+        cx.spawn(async move |this, cx| {
+            let head_text = committed_text.await?;
             let index_text = staged_text.await?;
-
-            let head_text = match &diff_bases_change {
-                DiffBasesChange::SetBoth(text) => text.clone(),
-                DiffBasesChange::SetEach { head, .. } => head.clone(),
-                DiffBasesChange::SetHead(text) => text.clone(),
-                DiffBasesChange::SetIndex(_) => None,
-            };
 
             let index_content = index_text.unwrap_or_default();
 
@@ -892,7 +885,7 @@ impl GitStore {
                     );
                     let mut buf =
                         language::Buffer::build(text_buffer, file, language::Capability::ReadOnly);
-                    if let Some(language) = language {
+                    if let Some(language) = language.clone() {
                         buf.set_language(Some(language), cx);
                     }
                     buf
@@ -910,17 +903,137 @@ impl GitStore {
                         index_snapshot.clone(),
                         base_text,
                         Some(false),
-                        None,
+                        language.clone(),
                         cx,
                     ));
                     diff.set_snapshot(inner, &index_snapshot, cx).detach();
                     diff
                 });
+                let secondary_diff = Self::empty_secondary_diff(&index_snapshot, language, cx);
+                diff.update(cx, |diff, _| diff.set_secondary_diff(secondary_diff));
                 (index_buffer, diff)
             });
+            this.update(cx, |this, cx| {
+                this.subscribe_to_index_text_updates(diff.clone(), repo, repo_path, cx);
+            })?;
 
             Ok((index_buffer, diff))
         })
+    }
+
+    pub fn open_unstaged_staging_diff(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<BufferDiff>>> {
+        let buffer_id = buffer.read(cx).remote_id();
+        let Some((repo, repo_path)) =
+            self.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+        else {
+            return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
+        };
+
+        let staged_text = repo.update(cx, |repo, cx| {
+            repo.load_staged_text(buffer_id, repo_path.clone(), cx)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let index_text = staged_text.await?;
+            let diff = cx.update(|cx| {
+                let buffer_snapshot = buffer.read(cx).text_snapshot();
+                let language = buffer.read(cx).language().cloned();
+
+                let base_text = index_text.clone().map(|mut text| {
+                    text::LineEnding::normalize(&mut text);
+                    Arc::from(text.as_str())
+                });
+                let diff: Entity<BufferDiff> = cx.new(|cx: &mut gpui::Context<BufferDiff>| {
+                    let mut diff = BufferDiff::new(&buffer_snapshot, cx);
+                    let inner = cx.foreground_executor().block_on(diff.update_diff(
+                        buffer_snapshot.clone(),
+                        base_text,
+                        Some(false),
+                        language.clone(),
+                        cx,
+                    ));
+                    diff.set_snapshot(inner, &buffer_snapshot, cx).detach();
+                    diff
+                });
+
+                let secondary_base_text = index_text.map(|mut text| {
+                    text::LineEnding::normalize(&mut text);
+                    Arc::from(text.as_str())
+                });
+                let secondary_diff: Entity<BufferDiff> =
+                    cx.new(|cx: &mut gpui::Context<BufferDiff>| {
+                        let mut diff = BufferDiff::new(&buffer_snapshot, cx);
+                        let inner = cx.foreground_executor().block_on(diff.update_diff(
+                            buffer_snapshot.clone(),
+                            secondary_base_text,
+                            Some(false),
+                            language,
+                            cx,
+                        ));
+                        diff.set_snapshot(inner, &buffer_snapshot, cx).detach();
+                        diff
+                    });
+                diff.update(cx, |diff, _| diff.set_secondary_diff(secondary_diff));
+                diff
+            });
+            this.update(cx, |this, cx| {
+                this.subscribe_to_index_text_updates(diff.clone(), repo, repo_path, cx);
+            })?;
+            Ok(diff)
+        })
+    }
+
+    fn empty_secondary_diff(
+        snapshot: &text::BufferSnapshot,
+        language: Option<Arc<Language>>,
+        cx: &mut App,
+    ) -> Entity<BufferDiff> {
+        cx.new(|cx: &mut gpui::Context<BufferDiff>| {
+            let mut diff = BufferDiff::new(snapshot, cx);
+            let inner = cx.foreground_executor().block_on(diff.update_diff(
+                snapshot.clone(),
+                Some(Arc::from(snapshot.text())),
+                Some(false),
+                language,
+                cx,
+            ));
+            diff.set_snapshot(inner, snapshot, cx).detach();
+            diff
+        })
+    }
+
+    fn subscribe_to_index_text_updates(
+        &mut self,
+        diff: Entity<BufferDiff>,
+        repo: Entity<Repository>,
+        repo_path: RepoPath,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe(&diff, move |_, diff, event: &BufferDiffEvent, cx| {
+            if let BufferDiffEvent::HunksStagedOrUnstaged(new_index_text) = event {
+                let new_index_text = new_index_text.as_ref().map(|rope| rope.to_string());
+                let recv = repo.update(cx, |repo, cx| {
+                    repo.spawn_set_index_text_job(repo_path.clone(), new_index_text, None, cx)
+                });
+                let diff = diff.downgrade();
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Err(error)) = cx.background_spawn(recv).await {
+                        diff.update(cx, |diff, cx| {
+                            diff.clear_pending_hunks(cx);
+                        })
+                        .ok();
+                        this.update(cx, |_, cx| cx.emit(GitStoreEvent::IndexWriteError(error)))
+                            .ok();
+                    }
+                })
+                .detach();
+            }
+        })
+        .detach();
     }
 
     pub fn open_unstaged_diff(
@@ -8065,6 +8178,28 @@ impl Repository {
         cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
     }
 
+    fn load_head_text(
+        &mut self,
+        buffer_id: BufferId,
+        repo_path: RepoPath,
+        cx: &App,
+    ) -> Task<Result<Option<String>>> {
+        let rx = self.send_job("load_head_text", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    anyhow::Ok(backend.load_committed_text(repo_path).await)
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => Ok(client
+                    .request(proto::OpenUncommittedDiff {
+                        project_id: project_id.0,
+                        buffer_id: buffer_id.to_proto(),
+                    })
+                    .await?
+                    .committed_text),
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
     fn load_committed_text(
         &mut self,
         buffer_id: BufferId,

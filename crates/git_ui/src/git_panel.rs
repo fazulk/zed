@@ -1473,10 +1473,13 @@ impl GitPanel {
             let workspace = self.workspace.upgrade()?;
             let git_repo = self.active_repository.as_ref()?;
 
-            let diff_base = match self.section_for_entry(selected_ix) {
-                Some(Section::Staged) => Some(DiffBase::Staged),
-                Some(Section::Unstaged) => Some(DiffBase::Unstaged),
-                _ => None,
+            let diff_base = match GitPanelSettings::get_global(cx).group_by {
+                GitPanelGroupBy::Staging => match self.section_for_entry(selected_ix) {
+                    Some(Section::Staged) => Some(DiffBase::Staged),
+                    Some(Section::Unstaged) => Some(DiffBase::Unstaged),
+                    _ => None,
+                },
+                GitPanelGroupBy::Status => None,
             };
 
             if diff_base.is_none() {
@@ -1523,9 +1526,24 @@ impl GitPanel {
                 .status_entry()?
                 .clone();
             let repository = self.active_repository.clone()?;
+            let diff_base = match GitPanelSettings::get_global(cx).group_by {
+                GitPanelGroupBy::Staging => match self.section_for_entry(self.selected_entry?) {
+                    Some(Section::Staged) => DiffBase::Staged,
+                    Some(Section::Unstaged) => DiffBase::Unstaged,
+                    _ => DiffBase::Head,
+                },
+                GitPanelGroupBy::Status => DiffBase::Head,
+            };
 
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
-                .detach_and_notify_err(self.workspace.clone(), window, cx);
+            SoloDiffView::open_or_focus(
+                entry,
+                repository,
+                self.workspace.clone(),
+                diff_base,
+                window,
+                cx,
+            )
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
         });
@@ -4009,7 +4027,7 @@ impl GitPanel {
                         )
                         .dismiss_button(true);
 
-                    if let Some(url) = pull_request_url.clone() {
+                    if let Some(url) = pull_request_url {
                         this.action("Open PR", move |_, cx| cx.open_url(&url))
                     } else {
                         this
@@ -8811,6 +8829,7 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
 
 #[cfg(test)]
 mod tests {
+    use editor::test::editor_test_context::assert_state_with_diff;
     use git::{
         repository::repo_path,
         status::{StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
@@ -8821,6 +8840,7 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use theme::LoadThemes;
+    use unindent::Unindent as _;
     use util::path;
     use util::rel_path::rel_path;
 
@@ -9055,6 +9075,159 @@ mod tests {
                 vec!["src/unstaged.rs".to_string()]
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_group_by_staging_opens_section_specific_solo_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "line 1\nnew staged\nnew unstaged\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "line 1\nold staged\nold unstaged\n".into())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "line 1\nnew staged\nold unstaged\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().group_by =
+                        Some(GitPanelGroupBy::Staging);
+                    settings.git_panel.get_or_insert_default().tree_view = Some(false);
+                })
+            });
+        });
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let entry_index = |panel: &GitPanel, section| {
+            panel
+                .entries
+                .iter()
+                .enumerate()
+                .position(|(index, entry)| {
+                    panel.staging_group_section_for_entry(index) == Some(section)
+                        && entry
+                            .status_entry()
+                            .is_some_and(|entry| entry.repo_path == repo_path("foo.txt"))
+                })
+                .unwrap()
+        };
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(entry_index(panel, Section::Staged));
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        let staged_editor = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .item_of_type::<SoloDiffView>(cx)
+                .unwrap()
+                .read(cx)
+                .editor()
+                .read(cx)
+                .rhs_editor()
+                .clone()
+        });
+        let hunks = staged_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            editor
+                .diff_hunks_in_ranges(&[editor::Anchor::Min..editor::Anchor::Max], &snapshot)
+                .map(|hunk| (hunk.status.is_added(), hunk.status.is_deleted()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(hunks, vec![(false, false)]);
+        assert_state_with_diff(
+            &staged_editor,
+            cx,
+            &"
+                  line 1
+                + ˇnew staged
+                  old unstaged
+            "
+            .unindent(),
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(entry_index(panel, Section::Unstaged));
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.update(cx, |workspace, cx| workspace
+                .items_of_type::<SoloDiffView>(cx)
+                .count()),
+            1
+        );
+
+        let unstaged_editor = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_item_as::<SoloDiffView>(cx)
+                .unwrap()
+                .read(cx)
+                .editor()
+                .read(cx)
+                .rhs_editor()
+                .clone()
+        });
+        let hunks = unstaged_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            editor
+                .diff_hunks_in_ranges(&[editor::Anchor::Min..editor::Anchor::Max], &snapshot)
+                .map(|hunk| (hunk.status.is_added(), hunk.status.is_deleted()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(hunks, vec![(false, false)]);
+        assert_state_with_diff(
+            &unstaged_editor,
+            cx,
+            &"
+                  line 1
+                  new staged
+                + ˇnew unstaged
+            "
+            .unindent(),
+        );
     }
 
     #[gpui::test]

@@ -293,11 +293,7 @@ impl Project {
 
     /// Starts resolving the shell environment for a terminal working directory
     /// so subsequent terminal spawns can reuse the cached result.
-    pub fn warm_up_terminal_environment(
-        &mut self,
-        cwd: Option<PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn warm_up_terminal_environment(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         let Some(cwd) = cwd else {
             return;
         };
@@ -320,7 +316,7 @@ impl Project {
             None => settings.shell.program(),
         };
         let env_shell = match &remote_client {
-            Some(_) => shell.clone(),
+            Some(_) => shell,
             None => get_system_shell(),
         };
 
