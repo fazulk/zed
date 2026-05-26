@@ -9228,6 +9228,21 @@ mod tests {
             "
             .unindent(),
         );
+
+        let repository = panel.read_with(cx, |panel, _| panel.active_repository.clone().unwrap());
+        let stage_task = repository.update(cx, |repository, cx| {
+            repository.stage_entries(vec![repo_path("foo.txt")], cx)
+        });
+        stage_task.await.unwrap();
+        cx.run_until_parked();
+
+        let hunk_count = unstaged_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            editor
+                .diff_hunks_in_ranges(&[editor::Anchor::Min..editor::Anchor::Max], &snapshot)
+                .count()
+        });
+        assert_eq!(hunk_count, 0);
     }
 
     #[gpui::test]
