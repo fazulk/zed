@@ -661,6 +661,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_diff_checkpoints);
         client.add_entity_request_handler(Self::handle_load_commit_diff);
         client.add_entity_request_handler(Self::handle_checkout_files);
+        client.add_entity_request_handler(Self::handle_discard_unstaged_changes);
         client.add_entity_request_handler(Self::handle_open_commit_message_buffer);
         client.add_entity_request_handler(Self::handle_set_index_text);
         client.add_entity_request_handler(Self::handle_askpass);
@@ -3314,6 +3315,28 @@ impl GitStore {
         Ok(proto::Ack {})
     }
 
+    async fn handle_discard_unstaged_changes(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitDiscardUnstagedChanges>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let paths = envelope
+            .payload
+            .paths
+            .iter()
+            .map(|s| RepoPath::from_proto(s))
+            .collect::<Result<Vec<_>>>()?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.discard_unstaged_changes(paths, cx)
+            })
+            .await?;
+        Ok(proto::Ack {})
+    }
+
     async fn handle_open_commit_message_buffer(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::OpenCommitMessageBuffer>,
@@ -5108,6 +5131,55 @@ impl Repository {
                                             project_id: project_id.0,
                                             repository_id: id.to_proto(),
                                             commit,
+                                            paths: paths
+                                                .into_iter()
+                                                .map(|p| p.to_proto())
+                                                .collect(),
+                                        })
+                                        .await?;
+
+                                    Ok(())
+                                }
+                            }
+                        },
+                    )
+                })?
+                .await?
+            },
+        )
+    }
+
+    pub fn discard_unstaged_changes(
+        &mut self,
+        paths: Vec<RepoPath>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let id = self.id;
+
+        self.spawn_job_with_tracking(
+            paths.clone(),
+            pending_op::GitStatus::Reverted,
+            cx,
+            async move |this, cx| {
+                this.update(cx, |this, _cx| {
+                    this.send_job(
+                        "discard_unstaged_changes",
+                        Some("git checkout --".into()),
+                        move |git_repo, _| async move {
+                            match git_repo {
+                                RepositoryState::Local(LocalRepositoryState {
+                                    backend,
+                                    environment,
+                                    ..
+                                }) => backend.discard_unstaged_changes(paths, environment).await,
+                                RepositoryState::Remote(RemoteRepositoryState {
+                                    project_id,
+                                    client,
+                                }) => {
+                                    client
+                                        .request(proto::GitDiscardUnstagedChanges {
+                                            project_id: project_id.0,
+                                            repository_id: id.to_proto(),
                                             paths: paths
                                                 .into_iter()
                                                 .map(|p| p.to_proto())

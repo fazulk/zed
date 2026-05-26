@@ -841,6 +841,12 @@ pub trait GitRepository: Send + Sync {
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    fn discard_unstaged_changes(
+        &self,
+        paths: Vec<RepoPath>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
     fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>>;
@@ -1457,6 +1463,34 @@ impl GitRepository for RealGitRepository {
             anyhow::ensure!(
                 output.status.success(),
                 "Failed to checkout files:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn discard_unstaged_changes(
+        &self,
+        paths: Vec<RepoPath>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+        async move {
+            if paths.is_empty() {
+                return Ok(());
+            }
+
+            let git = git_binary?;
+            let output = git
+                .build_command(&["checkout", "--"])
+                .envs(env.iter())
+                .args(paths.iter().map(|path| path.as_unix_str()))
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to discard unstaged changes:\n{}",
                 String::from_utf8_lossy(&output.stderr),
             );
             Ok(())
@@ -3988,6 +4022,58 @@ mod tests {
         //         .ok(),
         //     None
         // );
+    }
+
+    #[gpui::test]
+    async fn test_discard_unstaged_changes_preserves_staged_content(cx: &mut TestAppContext) {
+        disable_git_global_config();
+
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let file_path = repo_dir.path().join("file.txt");
+        smol::fs::write(&file_path, "base\n").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repo.stage_paths(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(checkpoint_author_envs()),
+        )
+        .await
+        .unwrap();
+
+        smol::fs::write(&file_path, "staged\n").await.unwrap();
+        repo.stage_paths(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        smol::fs::write(&file_path, "unstaged\n").await.unwrap();
+
+        repo.discard_unstaged_changes(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            smol::fs::read_to_string(&file_path).await.unwrap(),
+            "staged\n"
+        );
+        let staged_text = run_git(repo_dir.path(), &["show", ":file.txt"], cx)
+            .await
+            .unwrap();
+        assert_eq!(staged_text, "staged");
     }
 
     #[gpui::test]

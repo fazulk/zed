@@ -342,6 +342,47 @@ impl GitRepository for FakeGitRepository {
         unimplemented!()
     }
 
+    fn discard_unstaged_changes(
+        &self,
+        paths: Vec<RepoPath>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async move {
+            let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+            let contents = self
+                .with_state_async(false, move |state| {
+                    Ok(paths
+                        .into_iter()
+                        .map(|path| {
+                            let content = state.index_contents.get(&path).cloned();
+                            (path, content)
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .await?;
+
+            for (path, content) in contents {
+                let abs_path = workdir_path.join(path.as_std_path());
+                if let Some(content) = content {
+                    self.fs.write(&abs_path, content.as_bytes()).await?;
+                } else {
+                    self.fs
+                        .remove_file(
+                            &abs_path,
+                            RemoveOptions {
+                                recursive: false,
+                                ignore_if_not_exists: true,
+                            },
+                        )
+                        .await?;
+                }
+            }
+
+            Ok(())
+        }
+        .boxed()
+    }
+
     fn path(&self) -> PathBuf {
         self.repository_dir_path.clone()
     }
