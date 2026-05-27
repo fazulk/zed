@@ -485,7 +485,11 @@ message Envelope {
     SearchCommitsResponse search_commits_response = 450;
     GetInitialGraphData get_initial_graph_data = 451;
     GetInitialGraphDataResponse get_initial_graph_data_response = 452;
-    GitDiscardUnstagedChanges git_discard_unstaged_changes = 453; // current max
+    GetDocumentLinks get_document_links = 453;
+    GetDocumentLinksResponse get_document_links_response = 454;
+    ResolveDocumentLink resolve_document_link = 455;
+    ResolveDocumentLinkResponse resolve_document_link_response = 456;
+    GitDiscardUnstagedChanges git_discard_unstaged_changes = 457; // current max
   }
 
   reserved 87 to 88;
