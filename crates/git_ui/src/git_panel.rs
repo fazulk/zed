@@ -3451,18 +3451,28 @@ impl GitPanel {
                 let fetch = repo.update(cx, |repo, cx| {
                     repo.fetch(fetch_options.clone(), askpass, cx)
                 });
+                let remote_message = fetch.await;
 
-                let remote_message = fetch.await?;
                 this.update(cx, |this, cx| {
                     let action = match fetch_options {
                         FetchOptions::All => RemoteAction::Fetch(None),
                         FetchOptions::Remote(remote) => RemoteAction::Fetch(Some(remote)),
                     };
                     match remote_message {
-                        Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
-                        Err(e) => {
+                        Ok(Ok(remote_message)) => {
+                            this.show_remote_output(action, remote_message, cx)
+                        }
+                        Ok(Err(e)) => {
                             log::error!("Error while fetching {:?}", e);
                             this.show_error_toast(action.name(), e, cx)
+                        }
+                        Err(e) => {
+                            log::error!("Error while fetching {:?}", e);
+                            this.show_error_toast(
+                                action.name(),
+                                anyhow::anyhow!("git fetch task canceled: {e}"),
+                                cx,
+                            )
                         }
                     }
 
@@ -3615,15 +3625,22 @@ impl GitPanel {
             let pull = repo.update(cx, |repo, cx| {
                 repo.pull(branch_name, remote.name.clone(), rebase, askpass, cx)
             });
-
-            let remote_message = pull.await?;
+            let remote_message = pull.await;
 
             let action = RemoteAction::Pull(remote);
             this.update(cx, |this, cx| match remote_message {
-                Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
-                Err(e) => {
+                Ok(Ok(remote_message)) => this.show_remote_output(action, remote_message, cx),
+                Ok(Err(e)) => {
                     log::error!("Error while pulling {:?}", e);
                     this.show_error_toast(action.name(), e, cx)
+                }
+                Err(e) => {
+                    log::error!("Error while pulling {:?}", e);
+                    this.show_error_toast(
+                        action.name(),
+                        anyhow::anyhow!("git pull task canceled: {e}"),
+                        cx,
+                    )
                 }
             })
             .ok();
@@ -3676,12 +3693,13 @@ impl GitPanel {
         );
 
         cx.spawn_in(window, async move |this, cx| {
+            let action_name = if force_push { "force push" } else { "push" };
             let remote = match remote.await {
                 Ok(Some(remote)) => remote,
                 Ok(None) => {
                     this.update(cx, |this, cx| {
                         this.show_error_toast(
-                            "push",
+                            action_name,
                             anyhow::anyhow!("No remote available to push to. Add a remote to be able to publish changes."),
                             cx,
                         )
@@ -3691,14 +3709,14 @@ impl GitPanel {
                 }
                 Err(e) => {
                     log::error!("Failed to get current remote: {}", e);
-                    this.update(cx, |this, cx| this.show_error_toast("push", e, cx))
+                    this.update(cx, |this, cx| this.show_error_toast(action_name, e, cx))
                         .ok();
                     return Ok(());
                 }
             };
 
             let askpass_delegate = this.update_in(cx, |this, window, cx| {
-                this.askpass_delegate(format!("git push {}", remote.name), window, cx)
+                this.askpass_delegate(format!("git {action_name} {}", remote.name), window, cx)
             })?;
 
             let push = repo.update(cx, |repo, cx| {
@@ -3718,17 +3736,29 @@ impl GitPanel {
                     cx,
                 )
             });
+            let remote_message = push.await;
 
-            let remote_output = push.await?;
-
-            let action = RemoteAction::Push(branch.name().to_owned().into(), remote);
-            this.update(cx, |this, cx| match remote_output {
-                Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
-                Err(e) => {
+            let action = RemoteAction::Push {
+                branch_name: branch.name().to_owned().into(),
+                remote,
+                force: force_push,
+            };
+            this.update(cx, |this, cx| match remote_message {
+                Ok(Ok(remote_message)) => this.show_remote_output(action, remote_message, cx),
+                Ok(Err(e)) => {
                     log::error!("Error while pushing {:?}", e);
                     this.show_error_toast(action.name(), e, cx)
                 }
-            })?;
+                Err(e) => {
+                    log::error!("Error while pushing {:?}", e);
+                    this.show_error_toast(
+                        action.name(),
+                        anyhow::anyhow!("git push task canceled: {e}"),
+                        cx,
+                    )
+                }
+            })
+            .ok();
 
             anyhow::Ok(())
         })

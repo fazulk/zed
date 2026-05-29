@@ -498,6 +498,7 @@ impl AcpConnectionDefaults {
                 default_config_options,
                 ..
             } => default_config_options.clone(),
+            CustomAgentServerSettings::Terminal { .. } => HashMap::default(),
         };
         self.set(
             agent_settings.default_mode().map(acp::SessionModeId::new),
