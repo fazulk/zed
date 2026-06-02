@@ -11444,6 +11444,60 @@ async fn test_repository_pending_ops_staging(
 }
 
 #[gpui::test]
+async fn test_repository_discard_unstaged_changes_preserves_index(
+    executor: gpui::BackgroundExecutor,
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "my-repo": {
+                ".git": {},
+                "a.txt": "a",
+            }
+        }),
+    )
+    .await;
+
+    fs.set_status_for_repo(
+        path!("/root/my-repo/.git").as_ref(),
+        &[(
+            "a.txt",
+            TrackedStatus {
+                index_status: StatusCode::Modified,
+                worktree_status: StatusCode::Modified,
+            }
+            .into(),
+        )],
+    );
+
+    let project = Project::test(fs.clone(), [path!("/root/my-repo").as_ref()], cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let repo = project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+
+    repo.update(cx, |repo, cx| {
+        repo.discard_unstaged_changes(vec![repo_path("a.txt")], cx)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs.load(path!("/root/my-repo/a.txt").as_ref())
+            .await
+            .unwrap(),
+        "a (modified in working copy)"
+    );
+}
+
+#[gpui::test]
 async fn test_repository_pending_ops_long_running_staging(
     executor: gpui::BackgroundExecutor,
     cx: &mut gpui::TestAppContext,

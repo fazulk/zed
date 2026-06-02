@@ -995,6 +995,10 @@
     //
     // Default: true
     "diff_stats": true,
+    // Whether to show the embedded commit message editor in the Git panel.
+    //
+    // Default: true
+    "show_commit_editor": true,
     // Maximum length of the commit message title before a warning is shown.
     // Set to 0 to disable.
     //
