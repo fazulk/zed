@@ -4047,25 +4047,25 @@ impl GitPanel {
     async fn load_pull_request_with_gh(
         context: GhPullRequestContext,
     ) -> anyhow::Result<Option<GhPullRequest>> {
-        let output = Self::run_gh_command(
+        let output = match Self::run_gh_command(
             context.work_directory_abs_path,
             vec![
                 "pr".into(),
-                "list".into(),
-                "--head".into(),
-                context.source_branch,
-                "--state".into(),
-                "open".into(),
+                "view".into(),
                 "--json".into(),
                 "number,title,body,url".into(),
-                "--limit".into(),
-                "1".into(),
             ],
         )
-        .await?;
-        let mut pull_requests = serde_json::from_str::<Vec<GhPullRequest>>(&output)
-            .context("failed to parse gh pull request output")?;
-        Ok(pull_requests.pop())
+        .await
+        {
+            Ok(output) => output,
+            Err(error) if Self::is_no_pull_request_found_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(
+            serde_json::from_str::<GhPullRequest>(&output)
+                .context("failed to parse gh pull request output")?,
+        ))
     }
 
     async fn load_existing_pull_request_after_create_error(
@@ -4178,6 +4178,13 @@ impl GitPanel {
         })
     }
 
+    fn is_no_pull_request_found_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<GhCommandError>().is_some_and(|error| {
+            let output = format!("{}\n{}", error.stderr, error.stdout).to_lowercase();
+            output.contains("no pull requests found")
+        })
+    }
+
     fn pull_request_url_from_gh_error(error: &anyhow::Error) -> Option<String> {
         let error = error.downcast_ref::<GhCommandError>()?;
         Self::extract_url_from_output(&error.stderr)
@@ -4278,9 +4285,9 @@ impl GitPanel {
     }
 
     pub fn update_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pull_request) = self.current_pull_request().cloned() else {
+        if self.current_pull_request().is_none() {
             return;
-        };
+        }
         let context = match self.gh_pull_request_context(cx) {
             Ok(context) => context,
             Err(err) => {
@@ -4298,6 +4305,14 @@ impl GitPanel {
         self.show_pull_request_updating_toast(cx);
         self.update_pull_request_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = async {
+                let pull_request = Self::load_pull_request_with_gh(context.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No open pull request found for branch {}",
+                            context.source_branch
+                        )
+                    })?;
                 let Some(ConfiguredModel {
                     provider: model_provider,
                     model,
@@ -9294,6 +9309,19 @@ mod tests {
             stderr,
         });
 
+        assert!(!GitPanel::is_pull_request_already_exists_error(&error));
+    }
+
+    #[test]
+    fn test_detects_no_pull_request_found_error() {
+        let stderr = "no pull requests found for branch \"main\"".to_string();
+        let error = anyhow::Error::new(GhCommandError {
+            message: stderr.clone(),
+            stdout: String::new(),
+            stderr,
+        });
+
+        assert!(GitPanel::is_no_pull_request_found_error(&error));
         assert!(!GitPanel::is_pull_request_already_exists_error(&error));
     }
 

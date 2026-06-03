@@ -3904,6 +3904,26 @@ mod tests {
         env
     }
 
+    #[cfg(unix)]
+    fn write_git_argument_recorder(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(
+            path,
+            r#"#!/bin/sh
+: > "$CAPTURE_GIT_ARGS"
+for argument in "$@"; do
+  printf '%s\n' "$argument" >> "$CAPTURE_GIT_ARGS"
+done
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     #[track_caller]
     fn assert_same_path(left: impl AsRef<Path>, right: impl AsRef<Path>) {
         assert_eq!(
@@ -3982,6 +4002,59 @@ mod tests {
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir,
         );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_force_push_uses_force_with_lease(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let git_wrapper_path = temp_dir.path().join("git-wrapper");
+        let git_arguments_path = temp_dir.path().join("git-arguments");
+
+        git_init_repo(&repo_dir);
+        write_git_argument_recorder(&git_wrapper_path);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some(git_wrapper_path),
+            cx.executor(),
+        )
+        .unwrap();
+        let mut env = test_commit_envs();
+        env.insert(
+            "CAPTURE_GIT_ARGS".to_string(),
+            git_arguments_path.to_string_lossy().into_owned(),
+        );
+
+        repo.push(
+            "feature".to_string(),
+            "feature".to_string(),
+            "origin".to_string(),
+            Some(PushOptions::Force),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(env),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        let arguments = fs::read_to_string(git_arguments_path).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        let push_index = arguments
+            .iter()
+            .position(|argument| *argument == "push")
+            .unwrap();
+
+        assert_eq!(
+            &arguments[push_index..],
+            ["push", "--force-with-lease", "origin", "feature:feature"]
+        );
+        assert!(!arguments.iter().any(|argument| *argument == "--force"));
     }
 
     #[gpui::test]
