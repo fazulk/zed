@@ -6032,6 +6032,7 @@ fn panels_page() -> SettingsPage {
                 title: "Show Commit Editor",
                 description: "Whether to show the embedded commit message editor in the Git panel.",
                 field: Box::new(SettingField {
+                    organization_override: None,
                     json_path: Some("git_panel.show_commit_editor"),
                     pick: |settings_content| {
                         settings_content
