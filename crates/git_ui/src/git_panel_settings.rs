@@ -2,7 +2,7 @@ use editor::{EditorSettings, ui_scrollbar_settings_from_raw};
 use gpui::Pixels;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{RegisterSetting, Settings, StatusStyle};
+use settings::{GitPanelGroupBy, RegisterSetting, Settings, StatusStyle};
 use ui::{
     px,
     scrollbars::{ScrollbarVisibility, ShowScrollbar},
@@ -30,7 +30,9 @@ pub struct GitPanelSettings {
     pub diff_stats: bool,
     pub show_count_badge: bool,
     pub starts_open: bool,
+    pub show_commit_editor: bool,
     pub commit_title_max_length: usize,
+    pub group_by: GitPanelGroupBy,
 }
 
 #[derive(Default)]
@@ -77,7 +79,9 @@ impl Settings for GitPanelSettings {
             diff_stats: git_panel.diff_stats.unwrap(),
             show_count_badge: git_panel.show_count_badge.unwrap(),
             starts_open: git_panel.starts_open.unwrap(),
+            show_commit_editor: git_panel.show_commit_editor.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
+            group_by: git_panel.group_by.unwrap_or_default(),
         }
     }
 }

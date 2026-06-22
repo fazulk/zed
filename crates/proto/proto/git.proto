@@ -317,6 +317,13 @@ message GitCheckoutFiles {
   repeated string paths = 5;
 }
 
+message GitDiscardUnstagedChanges {
+  uint64 project_id = 1;
+  reserved 2;
+  uint64 repository_id = 3;
+  repeated string paths = 4;
+}
+
 // Move to `git.proto` once collab's min version is >=0.171.0.
 message StatusEntry {
   string repo_path = 1;

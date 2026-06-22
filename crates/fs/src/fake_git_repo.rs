@@ -12,9 +12,9 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        CreateWorktreeTarget, DiffStatType, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
     },
     stash::GitStash,
     status::{
@@ -331,6 +331,47 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
+    }
+
+    fn discard_unstaged_changes(
+        &self,
+        paths: Vec<RepoPath>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async move {
+            let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+            let contents = self
+                .with_state_async(false, move |state| {
+                    Ok(paths
+                        .into_iter()
+                        .map(|path| {
+                            let content = state.index_contents.get(&path).cloned();
+                            (path, content)
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .await?;
+
+            for (path, content) in contents {
+                let abs_path = workdir_path.join(path.as_std_path());
+                if let Some(content) = content {
+                    self.fs.write(&abs_path, content.as_bytes()).await?;
+                } else {
+                    self.fs
+                        .remove_file(
+                            &abs_path,
+                            RemoveOptions {
+                                recursive: false,
+                                ignore_if_not_exists: true,
+                            },
+                        )
+                        .await?;
+                }
+            }
+
+            Ok(())
+        }
+        .boxed()
     }
 
     fn path(&self) -> PathBuf {
@@ -1148,6 +1189,7 @@ impl GitRepository for FakeGitRepository {
 
     fn diff_stat(
         &self,
+        diff: DiffStatType,
         path_prefixes: &[RepoPath],
     ) -> BoxFuture<'static, Result<git::status::GitDiffStat>> {
         fn count_lines(s: &str) -> u32 {
@@ -1171,46 +1213,19 @@ impl GitRepository for FakeGitRepository {
             })
         }
 
-        let path_prefixes = path_prefixes.to_vec();
-
-        let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
-        let worktree_files: HashMap<RepoPath, String> = self
-            .fs
-            .files()
-            .iter()
-            .filter_map(|path| {
-                let repo_path = path.strip_prefix(&workdir_path).ok()?;
-                if repo_path.starts_with(".git") {
-                    return None;
-                }
-                let content = self
-                    .fs
-                    .read_file_sync(path)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
-                let repo_path = RelPath::new(repo_path, PathStyle::local()).ok()?;
-                Some((RepoPath::from_rel_path(&repo_path), content))
-            })
-            .collect();
-
-        self.with_state_async(false, move |state| {
+        fn stat_entries(
+            base: &HashMap<RepoPath, String>,
+            target: &HashMap<RepoPath, String>,
+            path_prefixes: &[RepoPath],
+        ) -> Vec<(RepoPath, git::status::DiffStat)> {
             let mut entries = Vec::new();
-            let all_paths: HashSet<&RepoPath> = state
-                .head_contents
-                .keys()
-                .chain(
-                    worktree_files
-                        .keys()
-                        .filter(|p| state.index_contents.contains_key(*p)),
-                )
-                .collect();
+            let all_paths: HashSet<&RepoPath> = base.keys().chain(target.keys()).collect();
             for path in all_paths {
-                if !matches_prefixes(path, &path_prefixes) {
+                if !matches_prefixes(path, path_prefixes) {
                     continue;
                 }
-                let head = state.head_contents.get(path);
-                let worktree = worktree_files.get(path);
-                match (head, worktree) {
+
+                match (base.get(path), target.get(path)) {
                     (Some(old), Some(new)) if old != new => {
                         entries.push((
                             path.clone(),
@@ -1242,8 +1257,52 @@ impl GitRepository for FakeGitRepository {
                 }
             }
             entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            entries
+        }
+
+        let path_prefixes = path_prefixes.to_vec();
+
+        let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+        let worktree_files: HashMap<RepoPath, String> = self
+            .fs
+            .files()
+            .iter()
+            .filter_map(|path| {
+                let repo_path = path.strip_prefix(&workdir_path).ok()?;
+                if repo_path.starts_with(".git") {
+                    return None;
+                }
+                let content = self
+                    .fs
+                    .read_file_sync(path)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
+                let repo_path = RelPath::new(repo_path, PathStyle::local()).ok()?;
+                Some((RepoPath::from_rel_path(&repo_path), content))
+            })
+            .collect();
+
+        self.with_state_async(false, move |state| {
+            let tracked_worktree_files = worktree_files
+                .iter()
+                .filter(|(path, _)| {
+                    state.head_contents.contains_key(*path)
+                        || state.index_contents.contains_key(*path)
+                })
+                .map(|(path, content)| (path.clone(), content.clone()))
+                .collect();
+            let indexed_worktree_files = worktree_files
+                .iter()
+                .filter(|(path, _)| state.index_contents.contains_key(*path))
+                .map(|(path, content)| (path.clone(), content.clone()))
+                .collect();
+            let (base, target) = match diff {
+                DiffStatType::HeadToWorktree => (&state.head_contents, &tracked_worktree_files),
+                DiffStatType::HeadToIndex => (&state.head_contents, &state.index_contents),
+                DiffStatType::IndexToWorktree => (&state.index_contents, &indexed_worktree_files),
+            };
             Ok(git::status::GitDiffStat {
-                entries: entries.into(),
+                entries: stat_entries(base, target, &path_prefixes).into(),
             })
         })
         .boxed()

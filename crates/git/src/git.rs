@@ -96,9 +96,9 @@ actions!(
         Fetch,
         /// Fetches changes from a specific remote.
         FetchFrom,
-        /// Creates a new commit with staged changes.
+        /// Creates a new commit, staging all changes first if nothing is staged.
         Commit,
-        /// Amends the last commit with staged changes.
+        /// Amends the last commit, staging all changes first if nothing is staged.
         Amend,
         /// Enable the --signoff option.
         Signoff,
@@ -111,6 +111,12 @@ actions!(
         ToggleFillCommitEditor,
         /// Generates a commit message using AI.
         GenerateCommitMessage,
+        /// Generates a commit message using AI, then creates a commit.
+        /// If nothing is staged, stages and commits all changes.
+        GenerateCommitMessageAndCommit,
+        /// Generates a commit message using AI, creates a commit, and pushes it.
+        /// If nothing is staged, stages and commits all changes.
+        GenerateCommitMessageAndCommitAndPush,
         /// Initializes a new git repository.
         Init,
         /// Opens all modified files in the editor.

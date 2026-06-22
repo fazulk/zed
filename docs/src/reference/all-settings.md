@@ -5391,7 +5391,8 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "scrollbar": {
       "show": null
     },
-    "starts_open": false
+    "starts_open": false,
+    "show_commit_editor": true
   }
 }
 ```
@@ -5407,6 +5408,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `collapse_untracked_diff`: Whether to collapse untracked files in the diff panel
 - `scrollbar`: When to show the scrollbar in the git panel
 - `starts_open`: Whether the git panel should open on startup
+- `show_commit_editor`: Whether to show the embedded commit message editor in the Git panel
 
 ## Git Worktree Directory
 

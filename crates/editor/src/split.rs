@@ -509,6 +509,7 @@ impl SplittableEditor {
             let mut editor =
                 Editor::for_multibuffer(rhs_multibuffer.clone(), Some(project.clone()), window, cx);
             editor.set_expand_all_diff_hunks(cx);
+            editor.set_delegate_stage_and_restore(true);
             editor.disable_runnables();
             editor.disable_code_lens(cx);
             editor.disable_inline_diagnostics();
@@ -533,6 +534,20 @@ impl SplittableEditor {
                             *direction,
                             cx,
                         );
+                    }
+                    EditorEvent::StageOrUnstageRequested { stage, hunks } => {
+                        let stage = *stage;
+                        this.rhs_editor.update(cx, |editor, cx| {
+                            let chunk_by = hunks.iter().cloned().chunk_by(|hunk| hunk.buffer_id);
+                            for (buffer_id, hunks) in &chunk_by {
+                                editor.do_stage_or_unstage(stage, buffer_id, hunks, cx);
+                            }
+                        });
+                    }
+                    EditorEvent::RestoreRequested { hunks } => {
+                        this.rhs_editor.update(cx, |editor, cx| {
+                            editor.restore_diff_hunks(hunks.clone(), cx);
+                        });
                     }
                     _ => cx.emit(event.clone()),
                 },

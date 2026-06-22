@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 
 use git::repository::{Remote, RemoteCommandOutput};
+use linkify::{LinkFinder, LinkKind};
 use ui::SharedString;
 use util::ResultExt as _;
 
@@ -8,7 +9,11 @@ use util::ResultExt as _;
 pub enum RemoteAction {
     Fetch(Option<Remote>),
     Pull(Remote),
-    Push(SharedString, Remote),
+    Push {
+        branch_name: SharedString,
+        remote: Remote,
+        force: bool,
+    },
 }
 
 impl RemoteAction {
@@ -16,7 +21,13 @@ impl RemoteAction {
         match self {
             RemoteAction::Fetch(_) => "fetch",
             RemoteAction::Pull(_) => "pull",
-            RemoteAction::Push(_, _) => "push",
+            RemoteAction::Push { force, .. } => {
+                if *force {
+                    "force push"
+                } else {
+                    "push"
+                }
+            }
         }
     }
 }
@@ -24,6 +35,7 @@ impl RemoteAction {
 pub enum SuccessStyle {
     Toast,
     ToastWithLog { output: RemoteCommandOutput },
+    PushPrLink { text: String, link: String },
 }
 
 pub struct SuccessMessage {
@@ -116,17 +128,59 @@ pub fn format_output(action: &RemoteAction, output: RemoteCommandOutput) -> Succ
                 }
             }
         }
-        RemoteAction::Push(branch_name, remote_ref) => {
-            if output.stderr.ends_with("Everything up-to-date\n") {
-                SuccessMessage {
-                    message: "Push: Everything is up-to-date".to_string(),
-                    style: SuccessStyle::Toast,
+        RemoteAction::Push {
+            branch_name,
+            remote: remote_ref,
+            force,
+        } => {
+            let message = if output.stderr.ends_with("Everything up-to-date\n") {
+                if *force {
+                    "Force push: Everything is up-to-date".to_string()
+                } else {
+                    "Push: Everything is up-to-date".to_string()
                 }
+            } else if *force {
+                format!("Force pushed {} to {}", branch_name, remote_ref.name)
             } else {
-                SuccessMessage {
-                    message: format!("Pushed {} to {}", branch_name, remote_ref.name),
-                    style: SuccessStyle::ToastWithLog { output },
-                }
+                format!("Pushed {} to {}", branch_name, remote_ref.name)
+            };
+
+            let style = if output.stderr.ends_with("Everything up-to-date\n") {
+                Some(SuccessStyle::Toast)
+            } else if output.stderr.contains("\nremote: ") {
+                let pr_hints = [
+                    ("Create a pull request", "Create Pull Request"),
+                    ("Create pull request", "Create Pull Request"),
+                    ("create a merge request", "Create Merge Request"),
+                    ("View merge request", "View Merge Request"),
+                ];
+                pr_hints
+                    .iter()
+                    .find(|(indicator, _)| output.stderr.contains(indicator))
+                    .and_then(|(_, mapped)| {
+                        let finder = LinkFinder::new();
+
+                        output
+                            .stderr
+                            .lines()
+                            .filter(|line| line.trim_start().starts_with("remote:"))
+                            .find_map(|line| {
+                                finder
+                                    .links(line)
+                                    .find(|link| *link.kind() == LinkKind::Url)
+                                    .map(|link| SuccessStyle::PushPrLink {
+                                        text: mapped.to_string(),
+                                        link: link.as_str().to_string(),
+                                    })
+                            })
+                    })
+            } else {
+                None
+            };
+
+            SuccessMessage {
+                message,
+                style: style.unwrap_or(SuccessStyle::ToastWithLog { output }),
             }
         }
     }
@@ -139,12 +193,13 @@ mod tests {
 
     #[test]
     fn test_push_new_branch_pull_request() {
-        let action = RemoteAction::Push(
-            SharedString::new_static("test_branch"),
-            Remote {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
                 name: SharedString::new_static("test_remote"),
             },
-        );
+            force: false,
+        };
 
         let output = RemoteCommandOutput {
             stdout: String::new(),
@@ -168,12 +223,13 @@ mod tests {
 
     #[test]
     fn test_push_new_branch_merge_request() {
-        let action = RemoteAction::Push(
-            SharedString::new_static("test_branch"),
-            Remote {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
                 name: SharedString::new_static("test_remote"),
             },
-        );
+            force: false,
+        };
 
         let output = RemoteCommandOutput {
             stdout: String::new(),
@@ -197,12 +253,13 @@ mod tests {
 
     #[test]
     fn test_push_branch_existing_merge_request() {
-        let action = RemoteAction::Push(
-            SharedString::new_static("test_branch"),
-            Remote {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
                 name: SharedString::new_static("test_remote"),
             },
-        );
+            force: false,
+        };
 
         let output = RemoteCommandOutput {
             stdout: String::new(),
@@ -230,12 +287,13 @@ mod tests {
 
     #[test]
     fn test_push_new_branch_no_link() {
-        let action = RemoteAction::Push(
-            SharedString::new_static("test_branch"),
-            Remote {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
                 name: SharedString::new_static("test_remote"),
             },
-        );
+            force: false,
+        };
 
         let output = RemoteCommandOutput {
             stdout: String::new(),
@@ -257,5 +315,52 @@ mod tests {
         } else {
             panic!("Expected ToastWithLog variant");
         }
+    }
+
+    #[test]
+    fn test_force_push_success_message() {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
+                name: SharedString::new_static("test_remote"),
+            },
+            force: true,
+        };
+
+        let output = RemoteCommandOutput {
+            stdout: String::new(),
+            stderr: indoc! { "
+                To http://example.com/test/test.git
+                    + 80bd3c83be...e03d499d2e test_branch -> test_branch
+                ",
+            }
+            .to_string(),
+        };
+
+        let msg = format_output(&action, output);
+
+        assert_eq!(msg.message, "Force pushed test_branch to test_remote");
+        assert_eq!(action.name(), "force push");
+    }
+
+    #[test]
+    fn test_force_push_up_to_date_message() {
+        let action = RemoteAction::Push {
+            branch_name: SharedString::new_static("test_branch"),
+            remote: Remote {
+                name: SharedString::new_static("test_remote"),
+            },
+            force: true,
+        };
+
+        let output = RemoteCommandOutput {
+            stdout: String::new(),
+            stderr: "Everything up-to-date\n".to_string(),
+        };
+
+        let msg = format_output(&action, output);
+
+        assert_eq!(msg.message, "Force push: Everything is up-to-date");
+        assert!(matches!(msg.style, SuccessStyle::Toast));
     }
 }
